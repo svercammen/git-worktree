@@ -1,0 +1,1604 @@
+#!/usr/bin/env python3
+"""git-wt: Git worktree manager with IDE and dependency setup.
+
+Automates the full lifecycle of git worktrees including dependency installation,
+IDE configuration, and environment setup for monorepo development.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+
+# --- Configuration ---
+
+class Config:
+    """Configuration management with layered precedence."""
+
+    def __init__(self):
+        self.editor = "idea"
+        self.base_dir = "../worktrees/{repo}"
+        self.open_editor = True
+        self._load_config_file()
+        self._load_env_vars()
+
+    def _load_config_file(self):
+        """Load config from ~/.config/git-wt/config."""
+        config_path = Path.home() / ".config" / "git-wt" / "config"
+        if not config_path.exists():
+            return
+
+        try:
+            with open(config_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        if key == "EDITOR":
+                            self.editor = value
+                        elif key == "BASE_DIR":
+                            self.base_dir = value
+                        elif key == "OPEN_EDITOR":
+                            self.open_editor = value.lower() in ("true", "1", "yes")
+        except Exception as e:
+            print(f"Warning: Failed to load config file: {e}", file=sys.stderr)
+
+    def _load_env_vars(self):
+        """Load config from environment variables."""
+        if "GIT_WT_EDITOR" in os.environ:
+            self.editor = os.environ["GIT_WT_EDITOR"]
+        if "GIT_WT_BASE_DIR" in os.environ:
+            self.base_dir = os.environ["GIT_WT_BASE_DIR"]
+        if "GIT_WT_OPEN_EDITOR" in os.environ:
+            self.open_editor = os.environ["GIT_WT_OPEN_EDITOR"].lower() in ("true", "1", "yes")
+
+
+# --- Utility Functions ---
+
+def run_cmd(cmd: List[str], cwd: Optional[Path] = None, capture: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command and return the result."""
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=capture,
+            text=True,
+            check=check
+        )
+    except subprocess.CalledProcessError as e:
+        if check:
+            print(f"Error running command: {' '.join(cmd)}", file=sys.stderr)
+            if e.stderr:
+                print(e.stderr, file=sys.stderr)
+            raise
+        return e
+
+
+def get_git_root() -> Path:
+    """Get the root directory of the git repository."""
+    result = run_cmd(["git", "rev-parse", "--show-toplevel"])
+    return Path(result.stdout.strip())
+
+
+def get_repo_name() -> str:
+    """Get the repository name."""
+    git_root = get_git_root()
+    return git_root.name
+
+
+def default_base() -> str:
+    """Return the best default base branch: main > master > HEAD."""
+    for candidate in ("main", "master"):
+        if branch_exists(candidate):
+            return candidate
+    return "HEAD"
+
+
+def branch_exists(branch: str) -> bool:
+    """Check if a branch exists locally or remotely."""
+    result = run_cmd(["git", "rev-parse", "--verify", branch], check=False)
+    if result.returncode == 0:
+        return True
+    result = run_cmd(["git", "rev-parse", "--verify", f"origin/{branch}"], check=False)
+    return result.returncode == 0
+
+
+# --- Project Detection ---
+
+class Project:
+    """Represents a detected sub-project."""
+
+    def __init__(self, path: Path, name: str, project_type: str):
+        self.path = path
+        self.name = name
+        self.type = project_type
+        self.dependencies: Set[str] = set()
+
+    def __repr__(self):
+        return f"Project({self.name}, {self.type})"
+
+
+def detect_projects(root: Path) -> List[Project]:
+    """Detect all sub-projects in the repository."""
+    projects = []
+
+    # Check root directory
+    root_project = detect_project(root, ".")
+    if root_project:
+        projects.append(root_project)
+
+    # Check immediate subdirectories
+    for item in root.iterdir():
+        if item.is_dir() and not item.name.startswith("."):
+            project = detect_project(item, item.name)
+            if project:
+                projects.append(project)
+
+    # Parse Poetry dependencies
+    for project in projects:
+        if project.type == "poetry":
+            parse_poetry_dependencies(project)
+
+    return projects
+
+
+def detect_project(path: Path, name: str) -> Optional[Project]:
+    """Detect the type of a single project directory."""
+    pyproject = path / "pyproject.toml"
+
+    # Poetry project
+    if pyproject.exists():
+        with open(pyproject) as f:
+            content = f.read()
+            if "[tool.poetry]" in content:
+                return Project(path, name, "poetry")
+            # pip/uv project with pyproject.toml
+            return Project(path, name, "pip")
+
+    # pip project with requirements.txt
+    if (path / "requirements.txt").exists():
+        return Project(path, name, "pip")
+
+    # npm project
+    if (path / "package-lock.json").exists():
+        return Project(path, name, "npm")
+
+    # yarn project
+    if (path / "yarn.lock").exists():
+        return Project(path, name, "yarn")
+
+    # pnpm project
+    if (path / "pnpm-lock.yaml").exists():
+        return Project(path, name, "pnpm")
+
+    return None
+
+
+def parse_poetry_dependencies(project: Project):
+    """Parse local path dependencies from pyproject.toml."""
+    pyproject = project.path / "pyproject.toml"
+    if not pyproject.exists():
+        return
+
+    with open(pyproject) as f:
+        content = f.read()
+
+    # Look for path dependencies like: some-package = { path = "../other-package" }
+    pattern = r'(\w+(?:-\w+)*)\s*=\s*\{\s*path\s*=\s*"\.\.\/([^"]+)"'
+    for match in re.finditer(pattern, content):
+        dep_name = match.group(2)
+        project.dependencies.add(dep_name)
+
+
+def topological_sort(projects: List[Project]) -> List[Project]:
+    """Sort projects by dependencies using topological sort."""
+    # Create name to project mapping
+    by_name = {p.name: p for p in projects}
+
+    # Calculate in-degree
+    in_degree = {p.name: 0 for p in projects}
+    for project in projects:
+        for dep in project.dependencies:
+            if dep in in_degree:
+                in_degree[project.name] += 1
+
+    # Queue of projects with no dependencies
+    queue = [p for p in projects if in_degree[p.name] == 0]
+    result = []
+
+    while queue:
+        project = queue.pop(0)
+        result.append(project)
+
+        # Decrease in-degree for dependents
+        for other in projects:
+            if project.name in other.dependencies:
+                in_degree[other.name] -= 1
+                if in_degree[other.name] == 0:
+                    queue.append(other)
+
+    # Check for cycles
+    if len(result) != len(projects):
+        print("Warning: Circular dependencies detected, using default order", file=sys.stderr)
+        return projects
+
+    return result
+
+
+# --- Dependency Installation ---
+
+def get_source_python(source_path: Path, project_name: str) -> Optional[str]:
+    """Get the Python executable used by a Poetry project in the source worktree."""
+    source_project = source_path / project_name
+    if not source_project.exists():
+        return None
+    try:
+        result = run_cmd(["poetry", "env", "info", "--executable"], cwd=source_project, check=False)
+        if result.returncode == 0:
+            executable = result.stdout.strip()
+            real = Path(executable).resolve()
+            import re as _re
+            # Check centralized venv path suffix like "-py3.13"
+            m = _re.search(r'-py(\d+\.\d+)', str(real))
+            if m:
+                return f"python{m.group(1)}"
+            # Fallback: ask the executable for its version directly
+            # (works for both in-project .venv and centralized venvs)
+            ver_result = run_cmd([executable, "--version"], check=False)
+            if ver_result.returncode == 0:
+                ver_m = _re.match(r'Python (\d+\.\d+)', ver_result.stdout.strip())
+                if ver_m:
+                    return f"python{ver_m.group(1)}"
+    except Exception:
+        pass
+    return None
+
+
+def install_dependencies(worktree_path: Path, projects: List[Project], source_path: Optional[Path] = None) -> Dict[str, Path]:
+    """Install dependencies for all projects and return venv paths."""
+    poetry_projects = [p for p in projects if p.type == "poetry"]
+    sorted_poetry = topological_sort(poetry_projects)
+
+    venv_paths = {}
+
+    # Install Poetry projects in dependency order
+    for project in sorted_poetry:
+        print(f"Installing Poetry dependencies for {project.name}...")
+        try:
+            project_dir = worktree_path / project.name
+
+            # Ensure in-project venvs (creates poetry.toml if not present)
+            run_cmd(["poetry", "config", "--local", "virtualenvs.in-project", "true"], cwd=project_dir)
+
+            # Match the source worktree's Python version
+            if source_path:
+                python_cmd = get_source_python(source_path, project.name)
+                if python_cmd:
+                    print(f"  → using {python_cmd} (matching source worktree)")
+                    run_cmd(["poetry", "env", "use", python_cmd], cwd=project_dir)
+
+            run_cmd(["poetry", "install"], cwd=project_dir)
+
+            # Get venv path
+            result = run_cmd(["poetry", "env", "info", "-p"], cwd=project_dir)
+            venv_path = Path(result.stdout.strip())
+            venv_paths[project.name] = venv_path
+            print(f"  → venv at {venv_path}")
+        except Exception as e:
+            print(f"Warning: Failed to install {project.name}: {e}", file=sys.stderr)
+
+    # Install npm/yarn/pnpm projects
+    for project in projects:
+        if project.type in ("npm", "yarn", "pnpm"):
+            print(f"Installing {project.type} dependencies for {project.name}...")
+            try:
+                project_dir = worktree_path / project.name
+                if project.type == "npm":
+                    run_cmd(["npm", "ci"], cwd=project_dir)
+                elif project.type == "yarn":
+                    run_cmd(["yarn", "install", "--frozen-lockfile"], cwd=project_dir)
+                elif project.type == "pnpm":
+                    run_cmd(["pnpm", "install", "--frozen-lockfile"], cwd=project_dir)
+            except Exception as e:
+                print(f"Warning: Failed to install {project.name}: {e}", file=sys.stderr)
+        elif project.type == "pip":
+            print(f"Installing pip dependencies for {project.name}...")
+            try:
+                project_dir = worktree_path / project.name
+                run_cmd(["pip", "install", "-e", "."], cwd=project_dir)
+            except Exception as e:
+                print(f"Warning: Failed to install {project.name}: {e}", file=sys.stderr)
+
+    return venv_paths
+
+
+# --- IDE Setup ---
+
+def get_running_jetbrains_ides() -> List[str]:
+    """Return names of running JetBrains IDE processes.
+
+    IntelliJ/PyCharm read jdk.table.xml only at startup and overwrite it on
+    shutdown — so any edit made while the IDE is running will be lost. Callers
+    should abort before touching the SDK table if this returns a non-empty list.
+    """
+    names: List[str] = []
+    for proc in ("idea", "pycharm"):
+        result = run_cmd(["pgrep", "-l", proc], check=False)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    names.append(parts[1])
+    return names
+
+
+def get_jetbrains_config_dirs() -> List[Path]:
+    """Find all active JetBrains config directories."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "JetBrains"
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", "")) / "JetBrains"
+    else:
+        base = Path.home() / ".config" / "JetBrains"
+    if not base.exists():
+        return []
+    return sorted(
+        [d for d in base.iterdir() if d.is_dir() and (d / "options" / "jdk.table.xml").exists()],
+        reverse=True,
+    )
+
+
+def get_worktree_sdk_name(source_sdk_name: str, worktree_path: Path) -> str:
+    """Generate a worktree-specific SDK name from the source SDK name."""
+    wt_label = worktree_path.name
+    return f"{source_sdk_name} [wt:{wt_label}]"
+
+
+def register_jetbrains_sdks(
+    source_path: Path, worktree_path: Path, venv_paths: Dict[str, Path],
+) -> Dict[str, str]:
+    """Register worktree-specific SDKs in JetBrains' global jdk.table.xml.
+
+    Clones existing SDK entries for each project, replaces venv paths with
+    the worktree's venv paths, and gives them worktree-specific names.
+
+    Returns a mapping of source SDK name → worktree SDK name.
+    """
+    if not venv_paths:
+        return {}
+
+    config_dirs = get_jetbrains_config_dirs()
+    if not config_dirs:
+        return {}
+
+    sdk_name_map: Dict[str, str] = {}
+    user_home = str(Path.home())
+
+    for config_dir in config_dirs:
+        jdk_table_path = config_dir / "options" / "jdk.table.xml"
+        tree = ET.parse(jdk_table_path)
+        root = tree.getroot()
+
+        # Find the component that holds JDK entries
+        component = root.find(".//component[@name='ProjectJdkTable']")
+        if component is None:
+            continue
+
+        changed = False
+        for project_name, venv_path in venv_paths.items():
+            # Find ALL source SDK entries for this project
+            source_sdks = []
+            for jdk in component.findall("jdk"):
+                name_elem = jdk.find("name")
+                if name_elem is not None:
+                    sdk_name = name_elem.get("value", "")
+                    # Match SDKs containing (project_name) but skip existing worktree SDKs
+                    if f"({project_name})" in sdk_name and "[wt:" not in sdk_name:
+                        source_sdks.append(jdk)
+
+            if not source_sdks:
+                continue
+
+            import copy as copy_mod
+            for source_sdk in source_sdks:
+                source_name = source_sdk.find("name").get("value")
+                wt_name = get_worktree_sdk_name(source_name, worktree_path)
+                sdk_name_map[source_name] = wt_name
+
+                # Skip if already registered
+                already_exists = False
+                for jdk in component.findall("jdk"):
+                    n = jdk.find("name")
+                    if n is not None and n.get("value") == wt_name:
+                        already_exists = True
+                        break
+                if already_exists:
+                    continue
+
+                # Clone the SDK entry
+                new_sdk = copy_mod.deepcopy(source_sdk)
+
+                # Update name
+                new_sdk.find("name").set("value", wt_name)
+
+                # Update homePath
+                home_path = new_sdk.find("homePath")
+                if home_path is not None:
+                    new_home = str(venv_path / "bin" / "python")
+                    # Use $USER_HOME$ variable like IntelliJ does
+                    new_home = new_home.replace(user_home, "$USER_HOME$")
+                    home_path.set("value", new_home)
+
+                # Update venv paths in classPath roots
+                source_home = source_sdk.find("homePath")
+                if source_home is not None:
+                    source_venv_str = source_home.get("value", "").replace("$USER_HOME$", user_home)
+                    source_venv_dir = str(Path(source_venv_str).parent.parent)
+                    new_venv_dir = str(venv_path)
+
+                    for root_elem in new_sdk.findall(".//root[@url]"):
+                        url = root_elem.get("url", "")
+                        if source_venv_dir in url.replace("$USER_HOME$", user_home):
+                            # Replace venv path, preserving $USER_HOME$
+                            old_relative = source_venv_dir.replace(user_home, "$USER_HOME$")
+                            new_relative = new_venv_dir.replace(user_home, "$USER_HOME$")
+                            root_elem.set("url", url.replace(old_relative, new_relative))
+
+                    # Also update source paths (e.g. sibling-module references)
+                    for root_elem in new_sdk.findall(".//root[@url]"):
+                        url = root_elem.get("url", "")
+                        source_str = str(source_path).replace(user_home, "$USER_HOME$")
+                        wt_str = str(worktree_path).replace(user_home, "$USER_HOME$")
+                        if source_str in url:
+                            root_elem.set("url", url.replace(source_str, wt_str))
+
+                # Generate new UUID and strip ASSOCIATED_PROJECT_PATH so the
+                # cloned SDK isn't scoped to the source worktree's project path
+                # (which would hide it from the new worktree's project).
+                import uuid as uuid_mod
+                additional = new_sdk.find("additional")
+                if additional is not None:
+                    additional.set("SDK_UUID", str(uuid_mod.uuid4()))
+                    additional.attrib.pop("ASSOCIATED_PROJECT_PATH", None)
+
+                component.append(new_sdk)
+                changed = True
+
+        if changed:
+            tree.write(jdk_table_path, xml_declaration=True, encoding="utf-8")
+            print(f"  Registered {len([v for v in sdk_name_map.values()])} SDK(s) in {config_dir.name}")
+
+    return sdk_name_map
+
+
+def unregister_jetbrains_sdks(worktree_path: Path):
+    """Remove worktree-specific SDKs from JetBrains' global jdk.table.xml."""
+    wt_label = f"[wt:{worktree_path.name}]"
+
+    config_dirs = get_jetbrains_config_dirs()
+    for config_dir in config_dirs:
+        jdk_table_path = config_dir / "options" / "jdk.table.xml"
+        tree = ET.parse(jdk_table_path)
+        root = tree.getroot()
+
+        component = root.find(".//component[@name='ProjectJdkTable']")
+        if component is None:
+            continue
+
+        to_remove = []
+        for jdk in component.findall("jdk"):
+            name_elem = jdk.find("name")
+            if name_elem is not None and wt_label in name_elem.get("value", ""):
+                to_remove.append(jdk)
+
+        if to_remove:
+            for jdk in to_remove:
+                component.remove(jdk)
+            tree.write(jdk_table_path, xml_declaration=True, encoding="utf-8")
+            print(f"  Removed {len(to_remove)} SDK(s) from {config_dir.name}")
+
+
+def patch_iml_sdk_names(worktree_path: Path, sdk_name_map: Dict[str, str]):
+    """Patch jdkName references in .iml files to use worktree-specific SDK names."""
+    if not sdk_name_map:
+        return
+
+    for iml in worktree_path.glob("*/*.iml"):
+        try:
+            tree = ET.parse(iml)
+            root = tree.getroot()
+            changed = False
+
+            for entry in root.findall(".//orderEntry[@type='jdk']"):
+                old_name = entry.get("jdkName", "")
+                if old_name in sdk_name_map:
+                    entry.set("jdkName", sdk_name_map[old_name])
+                    changed = True
+
+            if changed:
+                tree.write(iml, xml_declaration=True, encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to patch {iml.name}: {e}", file=sys.stderr)
+
+
+def setup_jetbrains(source_path: Path, worktree_path: Path, venv_paths: Dict[str, Path]):
+    """Set up JetBrains IDE configuration."""
+    source_idea = source_path / ".idea"
+    if not source_idea.exists():
+        return
+
+    print("Setting up JetBrains IDE configuration...")
+    worktree_idea = worktree_path / ".idea"
+
+    # Files/dirs to skip
+    skip = {"workspace.xml", "dataSources", "shelf", "httpRequests"}
+
+    # Copy .idea directory
+    worktree_idea.mkdir(exist_ok=True)
+    for item in source_idea.iterdir():
+        if item.name in skip:
+            continue
+        dest = worktree_idea / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest)
+
+    # Copy RunManager from workspace.xml (Multirun, Docker, npm configs)
+    copy_workspace_run_manager(source_idea, worktree_idea)
+
+    # Copy .iml files
+    for iml in source_path.glob("*/*.iml"):
+        dest_dir = worktree_path / iml.parent.name
+        dest_dir.mkdir(exist_ok=True)
+        shutil.copy2(iml, dest_dir / iml.name)
+
+    # Register worktree-specific SDKs in IntelliJ's global SDK table
+    sdk_name_map = register_jetbrains_sdks(source_path, worktree_path, venv_paths)
+
+    # Patch .iml files to use worktree-specific SDK names
+    patch_iml_sdk_names(worktree_path, sdk_name_map)
+
+    # Patch run configurations: SDK_NAME references and absolute venv paths
+    run_configs_dir = worktree_idea / "runConfigurations"
+    if run_configs_dir.exists():
+        for xml_file in run_configs_dir.glob("*.xml"):
+            try:
+                patch_run_config_paths(xml_file, venv_paths, sdk_name_map)
+            except Exception as e:
+                print(f"Warning: Failed to patch {xml_file.name}: {e}", file=sys.stderr)
+
+
+def copy_workspace_run_manager(source_idea: Path, worktree_idea: Path):
+    """Copy the RunManager component from workspace.xml.
+
+    Preserves Compound (Multirun), Docker, and npm run configurations which
+    are stored in workspace.xml rather than individual runConfigurations/*.xml.
+    Strips temporary/generated configs (ad-hoc test runs) and user-specific state.
+    """
+    import copy as copy_mod
+
+    source_workspace = source_idea / "workspace.xml"
+    if not source_workspace.exists():
+        return
+
+    tree = ET.parse(source_workspace)
+    root = tree.getroot()
+
+    run_manager = None
+    for comp in root.findall("component"):
+        if comp.get("name") == "RunManager":
+            run_manager = copy_mod.deepcopy(comp)
+            break
+
+    if run_manager is None:
+        return
+
+    # Remove temporary/auto-generated configs (ad-hoc test runs)
+    for config in list(run_manager.findall("configuration")):
+        if config.get("temporary") == "true" or config.get("nameIsGenerated") == "true":
+            run_manager.remove(config)
+
+    # Remove recent_temporary list (user-specific)
+    for elem in list(run_manager.findall("recent_temporary")):
+        run_manager.remove(elem)
+
+    # Write minimal workspace.xml containing only RunManager
+    new_root = ET.Element("project", attrib={"version": "4"})
+    new_root.append(run_manager)
+    dest_workspace = worktree_idea / "workspace.xml"
+    ET.ElementTree(new_root).write(dest_workspace, xml_declaration=True, encoding="utf-8")
+
+
+def patch_run_config_paths(
+    xml_path: Path, venv_paths: Dict[str, Path], sdk_name_map: Optional[Dict[str, str]] = None,
+):
+    """Patch run configurations: SDK_NAME references and absolute venv paths."""
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    config = root.find(".//configuration")
+    if config is None:
+        return
+
+    changed = False
+
+    # Patch SDK_NAME to use worktree-specific SDK
+    if sdk_name_map:
+        sdk_name_elem = config.find("option[@name='SDK_NAME']")
+        if sdk_name_elem is not None:
+            old_sdk = sdk_name_elem.get("value", "")
+            if old_sdk in sdk_name_map:
+                sdk_name_elem.set("value", sdk_name_map[old_sdk])
+                changed = True
+                # Force IS_MODULE_SDK=true so IntelliJ resolves the interpreter
+                # via the module's .iml (which we also patch). With false,
+                # initial load shows a red cross until the config is re-saved.
+                ims_elem = config.find("option[@name='IS_MODULE_SDK']")
+                if ims_elem is not None and ims_elem.get("value") != "true":
+                    ims_elem.set("value", "true")
+
+    # Patch SCRIPT_NAME absolute venv paths
+    for option in config.findall("option"):
+        name = option.get("name")
+        value = option.get("value", "")
+
+        if name == "SCRIPT_NAME" and value.startswith("/"):
+            sdk_name_elem = config.find("option[@name='SDK_NAME']")
+            if sdk_name_elem is not None:
+                # Extract project name from SDK_NAME (e.g. "Python 3.13 (my-service) [wt:...]")
+                match = re.search(r'\(([^)]+)\)', sdk_name_elem.get("value", ""))
+                if match:
+                    service = match.group(1)
+                    venv_path = venv_paths.get(service)
+                    if venv_path:
+                        script_basename = Path(value).name
+                        option.set("value", str(venv_path / "bin" / script_basename))
+                        changed = True
+
+    if changed:
+        tree.write(xml_path, xml_declaration=True, encoding="utf-8")
+
+
+def setup_vscode(source_path: Path, worktree_path: Path, projects: List[Project], venv_paths: Dict[str, Path]):
+    """Set up VS Code configuration."""
+    print("Setting up VS Code configuration...")
+
+    vscode_dir = worktree_path / ".vscode"
+    vscode_dir.mkdir(exist_ok=True)
+
+    # Copy existing .vscode if present
+    source_vscode = source_path / ".vscode"
+    if source_vscode.exists():
+        for item in source_vscode.iterdir():
+            dest = vscode_dir / item.name
+            if item.is_file():
+                shutil.copy2(item, dest)
+
+    # No patching needed: launch.json uses ${workspaceFolder} which resolves
+    # to the worktree root automatically, and in-project .venv directories are
+    # at the same relative path in every worktree.
+
+
+def patch_vscode_launch(launch_config: dict, worktree_path: Path, venv_paths: Dict[str, Path]):
+    """Patch python interpreter paths in an existing launch.json in-place.
+
+    Updates the "python" field in each configuration to point to the worktree's
+    venv. Matches configs to projects by checking whether the config's "cwd"
+    contains the project name, falling back to a name substring match.
+    """
+    configurations = launch_config.get("configurations", [])
+    for config in configurations:
+        for project_name, venv_path in venv_paths.items():
+            cwd = config.get("cwd", "")
+            name = config.get("name", "")
+            if project_name in cwd or project_name in name:
+                config["python"] = str(venv_path / "bin" / "python")
+                break
+
+
+# --- Environment Files ---
+
+def handle_env_files(source_path: Path, worktree_path: Path, projects: List[Project], copy: bool = False):
+    """Handle .env files by symlinking or copying."""
+    print(f"{'Copying' if copy else 'Symlinking'} .env files...")
+
+    for project in projects:
+        source_project = source_path / project.name
+        worktree_project = worktree_path / project.name
+
+        if not source_project.exists():
+            continue
+
+        for env_file in source_project.glob(".env*"):
+            if not env_file.is_file():
+                continue
+            name = env_file.name
+            # Skip template/dist files — they're committed to git and should remain plain copies
+            if name.endswith(".dist") or name.endswith("-dist"):
+                dest = worktree_project / name
+                if not dest.exists():
+                    shutil.copy2(env_file, dest)
+                continue
+            dest = worktree_project / name
+            if copy:
+                shutil.copy2(env_file, dest)
+            else:
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                dest.symlink_to(env_file)
+
+
+def handle_claude_config(source_path: Path, worktree_path: Path):
+    """Symlink .claude/ directory so worktrees share Claude Code configuration."""
+    source_claude = source_path / ".claude"
+    dest_claude = worktree_path / ".claude"
+
+    if not source_claude.is_dir():
+        return
+
+    print("Symlinking .claude/ directory...")
+    if dest_claude.exists() or dest_claude.is_symlink():
+        if dest_claude.is_symlink():
+            dest_claude.unlink()
+        else:
+            shutil.rmtree(dest_claude)
+    dest_claude.symlink_to(source_claude)
+
+
+def handle_tfvars_files(source_path: Path, worktree_path: Path, copy: bool = False):
+    """Handle Terraform .tfvars files by symlinking or copying from terraform/ subdir."""
+    terraform_source = source_path / "terraform"
+    terraform_dest = worktree_path / "terraform"
+
+    if not terraform_source.exists():
+        return
+
+    tfvars_files = list(terraform_source.glob("*.tfvars"))
+    if not tfvars_files:
+        return
+
+    print(f"{'Copying' if copy else 'Symlinking'} .tfvars files...")
+    terraform_dest.mkdir(parents=True, exist_ok=True)
+
+    for tfvars_file in tfvars_files:
+        dest = terraform_dest / tfvars_file.name
+        if copy:
+            shutil.copy2(tfvars_file, dest)
+        else:
+            if dest.exists() or dest.is_symlink():
+                dest.unlink()
+            dest.symlink_to(tfvars_file)
+
+
+# --- Editor ---
+
+def open_editor(editor_cmd: str, worktree_path: Path):
+    """Open the worktree in the configured editor."""
+    print(f"Opening {worktree_path} in {editor_cmd}...")
+    try:
+        subprocess.Popen([editor_cmd, str(worktree_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"Warning: Failed to open editor: {e}", file=sys.stderr)
+
+
+# --- Commands ---
+
+def cmd_create(args, config: Config):
+    """Create a new worktree with full environment setup."""
+    # Validate we're in a git repo
+    try:
+        source_path = get_git_root()
+    except:
+        print("Error: Not in a git repository", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve branch
+    branch = args.branch
+    if not branch_exists(branch):
+        base = args.base or default_base()
+        print(f"Creating new branch '{branch}' from '{base}'...")
+        try:
+            run_cmd(["git", "branch", branch, base])
+        except subprocess.CalledProcessError:
+            sys.exit(1)
+
+    # Resolve worktree path
+    if args.path:
+        worktree_path = Path(args.path).resolve()
+    else:
+        base_dir = config.base_dir.replace("{repo}", get_repo_name())
+        base_path = source_path / base_dir
+        base_path.mkdir(parents=True, exist_ok=True)
+        worktree_path = base_path / branch.replace("/", "-")
+
+    if worktree_path.exists():
+        # Check if it's an orphaned directory (not registered as a git worktree)
+        registered = {Path(wt["path"]) for wt in get_worktrees()}
+        if worktree_path.resolve() not in registered:
+            print(f"Removing orphaned directory at {worktree_path}...")
+            shutil.rmtree(worktree_path)
+        else:
+            print(f"Error: Path '{worktree_path}' already exists", file=sys.stderr)
+            sys.exit(1)
+
+    # Create worktree
+    print(f"Creating worktree at {worktree_path}...")
+    try:
+        run_cmd(["git", "worktree", "add", str(worktree_path), branch])
+    except Exception as e:
+        print(f"Error: Failed to create worktree: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Detect projects
+    print("Detecting projects...")
+    projects = detect_projects(source_path)
+    print(f"Found {len(projects)} projects: {', '.join(p.name for p in projects)}")
+
+    # Install dependencies
+    venv_paths = {}
+    if not args.no_install:
+        try:
+            venv_paths = install_dependencies(worktree_path, projects, source_path=source_path)
+        except Exception as e:
+            print(f"Warning: Dependency installation failed: {e}", file=sys.stderr)
+            print(f"You can clean up with: git wt remove {worktree_path}", file=sys.stderr)
+
+    # Set up IDE
+    if not args.no_ide:
+        running_ides = get_running_jetbrains_ides()
+        if running_ides:
+            print(
+                f"Error: JetBrains IDE is running ({', '.join(running_ides)}). "
+                "It would overwrite jdk.table.xml edits on shutdown, breaking the "
+                "SDK registration. Close it and re-run `git wt create`, or pass "
+                "--no-ide to skip IDE setup.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            setup_jetbrains(source_path, worktree_path, venv_paths)
+            setup_vscode(source_path, worktree_path, projects, venv_paths)
+        except Exception as e:
+            print(f"Warning: IDE setup failed: {e}", file=sys.stderr)
+
+    # Handle .env files
+    try:
+        handle_env_files(source_path, worktree_path, projects, copy=args.copy_env)
+    except Exception as e:
+        print(f"Warning: .env file handling failed: {e}", file=sys.stderr)
+
+    # Handle Terraform .tfvars files
+    try:
+        handle_tfvars_files(source_path, worktree_path, copy=args.copy_env)
+    except Exception as e:
+        print(f"Warning: .tfvars file handling failed: {e}", file=sys.stderr)
+
+    # Handle .claude/ directory
+    try:
+        handle_claude_config(source_path, worktree_path)
+    except Exception as e:
+        print(f"Warning: .claude/ symlink failed: {e}", file=sys.stderr)
+
+    # Open editor
+    editor = args.editor or config.editor
+    if not args.no_open and config.open_editor:
+        open_editor(editor, worktree_path)
+
+    print(f"\n✓ Worktree created at {worktree_path}")
+
+    if getattr(args, "cd_file", None) and not args.no_cd:
+        try:
+            Path(args.cd_file).write_text(str(worktree_path))
+        except Exception:
+            pass
+
+
+def cmd_shell_init():
+    """Print shell integration code for eval in .zshrc / .bashrc."""
+    completions_dir = Path(__file__).resolve().parent / "completions"
+    print(f"""# git-wt shell integration — added by: eval "$(git wt shell-init)"
+fpath=({completions_dir} $fpath)
+# Explicitly register completion — works even when eval runs after oh-my-zsh/compinit
+autoload -Uz _wt
+(( ${{+functions[compdef]}} )) && compdef _wt wt""")
+    print(r"""
+wt() {
+  if [[ $# -eq 0 ]]; then
+    # TUI mode: pass temp files so the script can communicate cd path and expanded command back
+    local _wt_cd _wt_cmd _exit
+    _wt_cd=$(mktemp)
+    _wt_cmd=$(mktemp)
+    git wt --cd-file="$_wt_cd" --cmd-file="$_wt_cmd"
+    _exit=$?
+    if [[ $_exit -eq 0 && -s "$_wt_cd" ]]; then
+      builtin cd "$(cat "$_wt_cd")"
+    fi
+    if [[ -s "$_wt_cmd" ]]; then
+      local _cmd
+      _cmd=$(cat "$_wt_cmd")
+      print -s "$_cmd"
+      if command -v atuin &>/dev/null && atuin history list &>/dev/null 2>&1; then
+        local _atuin_id
+        _atuin_id=$(atuin history start -- "$_cmd" 2>/dev/null)
+        [[ -n "$_atuin_id" ]] && atuin history end --exit $_exit "$_atuin_id" 2>/dev/null
+      fi
+    fi
+    rm -f "$_wt_cd" "$_wt_cmd"
+    return $_exit
+  elif [[ "$1" == "create" ]]; then
+    local _wt_tmp
+    _wt_tmp=$(mktemp)
+    git wt create "${@:2}" --cd-file="$_wt_tmp"
+    local _exit=$?
+    if [[ $_exit -eq 0 && -s "$_wt_tmp" ]]; then
+      builtin cd "$(cat "$_wt_tmp")"
+    fi
+    rm -f "$_wt_tmp"
+    return $_exit
+  elif [[ "$1" == "switch" || "$1" == "-" || ( $# -eq 1 && "$1" != "--" && ! "$1" =~ ^- ) ]]; then
+    local _wt_tmp
+    _wt_tmp=$(mktemp)
+    git wt "$@" --cd-file="$_wt_tmp"
+    local _exit=$?
+    if [[ $_exit -eq 0 && -s "$_wt_tmp" ]]; then
+      builtin cd "$(cat "$_wt_tmp")"
+    fi
+    rm -f "$_wt_tmp"
+    return $_exit
+  else
+    git wt "$@"
+  fi
+}""")
+
+
+def cmd_remove(args, config):
+    """Destroy a worktree and clean up its environment."""
+    # Resolve worktree path
+    worktree_path = resolve_worktree(args.path_or_branch, config)
+    if not worktree_path:
+        print(f"Error: Worktree '{args.path_or_branch}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Confirm unless --force
+    if not args.force:
+        response = input(f"Destroy worktree at {worktree_path}? [y/N] ")
+        if response.lower() != "y":
+            print("Cancelled")
+            return
+
+    running_ides = get_running_jetbrains_ides()
+    if running_ides:
+        print(
+            f"Error: JetBrains IDE is running ({', '.join(running_ides)}). "
+            "It would overwrite jdk.table.xml edits on shutdown, leaving stale "
+            "SDK entries behind. Close it and re-run `git wt remove`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Destroying worktree at {worktree_path}...")
+
+    # Remove worktree-specific SDKs from JetBrains global SDK table
+    try:
+        unregister_jetbrains_sdks(worktree_path)
+    except Exception as e:
+        print(f"Warning: Failed to clean up JetBrains SDKs: {e}", file=sys.stderr)
+
+    # Remove .venv directories
+    for venv in worktree_path.glob("*/.venv"):
+        if venv.is_dir():
+            print(f"Removing {venv}...")
+            shutil.rmtree(venv)
+
+    # Remove node_modules directories
+    for nm in worktree_path.glob("*/node_modules"):
+        if nm.is_dir():
+            print(f"Removing {nm}...")
+            shutil.rmtree(nm)
+
+    # Remove worktree (always --force since user already confirmed or passed --force)
+    try:
+        run_cmd(["git", "worktree", "remove", str(worktree_path), "--force"])
+        run_cmd(["git", "worktree", "prune"])
+        print(f"✓ Worktree removed")
+    except Exception as e:
+        print(f"Error: Failed to remove worktree: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_worktrees() -> list:
+    """Return parsed worktree list. Each item has: path, branch, is_main."""
+    result = run_cmd(["git", "worktree", "list", "--porcelain"])
+    worktrees = []
+    current: dict = {}
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            if current:
+                worktrees.append(current)
+            current = {"path": Path(line.split(" ", 1)[1])}
+        elif line.startswith("branch "):
+            current["branch"] = line.split(" ", 1)[1].replace("refs/heads/", "")
+        elif line.startswith("bare"):
+            current["bare"] = True
+    if current:
+        worktrees.append(current)
+    for i, wt in enumerate(worktrees):
+        wt["is_main"] = (i == 0)
+        wt.setdefault("branch", "")
+    return worktrees
+
+
+def cmd_list(args):
+    """List all worktrees with status indicators."""
+    worktrees = get_worktrees()
+
+    for wt in worktrees:
+        path = wt["path"]
+        branch = wt.get("branch", "")
+
+        indicators = []
+
+        # Check for IDE configs
+        if (path / ".idea").exists():
+            indicators.append("idea")
+        if (path / ".vscode").exists():
+            indicators.append("vscode")
+
+        # Check for venvs
+        venv_count = len(list(path.glob("*/.venv")))
+        poetry_count = len(list(path.glob("*/poetry.lock")))
+        if venv_count > 0:
+            indicators.append(f"{venv_count}/{poetry_count} venvs")
+
+        # Check for node_modules
+        if list(path.glob("*/node_modules")):
+            indicators.append("node_modules")
+
+        status = f"[{', '.join(indicators)}]" if indicators else ""
+        print(f"{path}")
+        if branch:
+            print(f"  branch: {branch}")
+        if status:
+            print(f"  status: {status}")
+        print()
+
+
+def cmd_switch(args):
+    """Switch to a worktree by partial branch/path match. '-' goes to the main worktree."""
+    name = args.name
+    worktrees = get_worktrees()
+
+    if name == "-":
+        target = next((wt["path"] for wt in worktrees if wt.get("is_main")), None)
+        if not target:
+            print("Error: No main worktree found", file=sys.stderr)
+            sys.exit(1)
+    else:
+        matches = [
+            wt for wt in worktrees
+            if name.lower() in wt.get("branch", "").lower()
+            or name.lower() in str(wt["path"]).lower()
+        ]
+        if not matches:
+            print(f"Error: No worktree matching '{name}'", file=sys.stderr)
+            sys.exit(1)
+        if len(matches) > 1:
+            print(f"Error: Multiple worktrees match '{name}':", file=sys.stderr)
+            for m in matches:
+                print(f"  {m.get('branch') or m['path']}", file=sys.stderr)
+            sys.exit(1)
+        target = matches[0]["path"]
+
+    print(f"Switching to {target}...")
+    if getattr(args, "cd_file", None):
+        try:
+            Path(args.cd_file).write_text(str(target))
+        except Exception:
+            pass
+
+
+def resolve_worktree(path_or_branch: str, config: Optional["Config"] = None) -> Optional[Path]:
+    """Resolve a worktree path from a path or branch name."""
+    # Try as direct path
+    path = Path(path_or_branch)
+    if path.exists():
+        return path.resolve()
+
+    # Try to find in registered worktree list
+    result = run_cmd(["git", "worktree", "list", "--porcelain"])
+    current_path = None
+
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = Path(line.split(" ", 1)[1])
+        elif line.startswith("branch ") and current_path:
+            branch = line.split(" ", 1)[1].replace("refs/heads/", "")
+            if branch == path_or_branch or branch.endswith(f"/{path_or_branch}"):
+                return current_path
+            current_path = None
+
+    # Fall back to the computed path based on config (catches orphaned/unregistered dirs)
+    if config is not None:
+        try:
+            source_path = get_git_root().parent
+            base_dir = config.base_dir.replace("{repo}", get_repo_name())
+            computed = (source_path / base_dir / path_or_branch.replace("/", "-")).resolve()
+            if computed.exists():
+                return computed
+        except Exception:
+            pass
+
+    return None
+
+
+# --- TUI ---
+
+def run_tui() -> Optional[List[str]]:
+    """Show an interactive TUI when invoked with no arguments.
+
+    Returns a list of argv tokens (e.g. ["create", "my-branch", "--base", "main"])
+    to inject into sys.argv before argparse runs, or None if the user cancelled.
+    """
+    import curses
+
+    COMMANDS = ["create", "remove", "list"]
+    FIELD_W = 38  # visible width of text input boxes
+
+    class State:
+        def __init__(self):
+            self.tab = 0
+            self.focus = 0
+            self.error = ""
+            # create
+            self.branch = "";     self.branch_cur = 0
+            self.base = "";       self.base_cur = 0
+            self.no_install = False
+            self.no_open  = False
+            self.no_cd      = False
+            self.no_ide     = False
+            self.copy_env   = False
+            # remove
+            self.remove_pick = 0  # index into _removable
+            self.force = False
+
+    # Resolve default base for the Base field placeholder
+    try:
+        _default_base = default_base()
+    except Exception:
+        _default_base = "HEAD"
+    _base_placeholder = f"{_default_base} (if omitted)"
+
+    # Fetch worktrees once for remove picker and list tab
+    try:
+        _all_worktrees = get_worktrees()
+    except Exception:
+        _all_worktrees = []
+    _removable = [wt for wt in _all_worktrees if not wt.get("is_main")]
+
+    # (attr, label, is_cb, hint, placeholder, required)
+    # is_cb: False = text input, True = checkbox, "select" = ←/→ option picker
+    CREATE_FIELDS = [
+        ("branch",       "Branch:       ", False,    "name for the new branch",                   "",                 True),
+        ("base",         "Base:         ", False,    "branch name, HEAD, or commit SHA",           _base_placeholder,  False),
+        ("no_install",   "--no-install  ", True,     "skip dependency installation",               "",                 False),
+        ("no_open",      "--no-open     ", True,     "don't launch the editor after create",       "",                 False),
+        ("no_cd",        "--no-cd       ", True,     "don't cd into the worktree after creation",  "",                 False),
+        ("no_ide",       "--no-ide      ", True,     "skip IDE configuration",                     "",                 False),
+        ("copy_env",     "--copy-env    ", True,     "copy .env files instead of symlinking",      "",                 False),
+    ]
+    REMOVE_FIELDS = [
+        ("remove_pick", "Worktree:     ", "select",  "←/→ to cycle",             "", True),
+        ("force",        "--force       ", True,      "skip confirmation prompt",  "", False),
+    ]
+    LIST_FIELDS: list = []
+    FIELDS_BY_TAB = [CREATE_FIELDS, REMOVE_FIELDS, LIST_FIELDS]
+
+    s = State()
+
+    def cur_fields():
+        return FIELDS_BY_TAB[s.tab]
+
+    def build_argv() -> List[str]:
+        cmd = COMMANDS[s.tab]
+        if cmd == "create":
+            parts: List[str] = ["create"]
+            if s.branch:      parts.append(s.branch)
+            if s.base:        parts += ["--base", s.base]
+            if s.no_install:  parts.append("--no-install")
+            if s.no_open:     parts.append("--no-open")
+            if s.no_cd:       parts.append("--no-cd")
+            if s.no_ide:      parts.append("--no-ide")
+            if s.copy_env:    parts.append("--copy-env")
+        elif cmd == "remove":
+            parts = ["remove"]
+            if _removable:
+                wt = _removable[s.remove_pick]
+                parts.append(wt.get("branch") or str(wt["path"]))
+            if s.force:   parts.append("--force")
+        else:
+            parts = ["list"]
+        return parts
+
+    def get_text(attr: str) -> tuple:
+        return getattr(s, attr), getattr(s, attr + "_cur")
+
+    def set_text(attr: str, text: str, cur: int):
+        setattr(s, attr, text)
+        setattr(s, attr + "_cur", cur)
+
+    def handle_text_key(attr: str, key: int):
+        text, cur = get_text(attr)
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if cur > 0:
+                set_text(attr, text[:cur - 1] + text[cur:], cur - 1)
+        elif key == curses.KEY_DC:
+            if cur < len(text):
+                set_text(attr, text[:cur] + text[cur + 1:], cur)
+        elif key == curses.KEY_LEFT:
+            set_text(attr, text, max(0, cur - 1))
+        elif key == curses.KEY_RIGHT:
+            set_text(attr, text, min(len(text), cur + 1))
+        elif key == curses.KEY_HOME:
+            set_text(attr, text, 0)
+        elif key == curses.KEY_END:
+            set_text(attr, text, len(text))
+        elif 32 <= key < 127:
+            set_text(attr, text[:cur] + chr(key) + text[cur:], cur + 1)
+
+    def draw(stdscr):
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        cursor_pos = None
+        row = 0
+
+        # Title
+        stdscr.addstr(row, 2, "git wt", curses.A_BOLD)
+        row += 1
+        stdscr.addstr(row, 2, "─" * min(w - 4, 60))
+        row += 1
+
+        # Tab bar
+        x = 2
+        for i, cmd in enumerate(COMMANDS):
+            label = f" {cmd} "
+            attr = curses.A_REVERSE | curses.A_BOLD if i == s.tab else curses.A_DIM
+            stdscr.addstr(row, x, label, attr)
+            x += len(label) + 1
+        stdscr.addstr(row, x + 1, "Tab/Shift+Tab: switch tab", curses.A_DIM)
+        row += 2
+
+        # Form fields
+        fields = cur_fields()
+        for i, (attr, label, is_cb, hint, placeholder, required) in enumerate(fields):
+            is_focused = (i == s.focus)
+            # is_missing: text fields only; select fields missing if no options
+            if required and is_cb == "select":
+                is_missing = not _removable
+            elif required and not is_cb:
+                is_missing = not getattr(s, attr)
+            else:
+                is_missing = False
+            col = 4
+
+            # Required marker (* at col 2, dimmed when filled, bold when missing)
+            if required:
+                marker_attr = curses.A_BOLD if is_missing else curses.A_DIM
+                stdscr.addstr(row, 2, "*", marker_attr)
+
+            if is_cb == "select":
+                fa = curses.A_BOLD if is_focused else 0
+                stdscr.addstr(row, col, label, fa)
+                field_x = col + len(label)
+                if _removable:
+                    wt = _removable[s.remove_pick]
+                    val = wt.get("branch") or str(wt["path"].name)
+                    n = len(_removable)
+                    display = f"◂ {val} ▸  ({s.remove_pick + 1}/{n})"
+                    display = display[:FIELD_W].ljust(FIELD_W)
+                    field_attr = curses.A_REVERSE if is_focused else curses.A_UNDERLINE
+                    stdscr.addstr(row, field_x, display, field_attr)
+                else:
+                    stdscr.addstr(row, field_x, " (no linked worktrees) ".ljust(FIELD_W), curses.A_DIM | curses.A_UNDERLINE)
+                if hint:
+                    hint_x = field_x + FIELD_W + 2
+                    if hint_x + len(hint) < w - 1:
+                        stdscr.addstr(row, hint_x, hint, curses.A_DIM)
+            elif is_cb:
+                val = getattr(s, attr)
+                checkbox = "[x]" if val else "[ ]"
+                fa = curses.A_BOLD if is_focused else 0
+                stdscr.addstr(row, col, checkbox, fa)
+                stdscr.addstr(row, col + 4, label, fa)
+                stdscr.addstr(row, col + 4 + len(label), hint, curses.A_DIM)
+            else:
+                text, cur = get_text(attr)
+                fa = curses.A_BOLD if is_focused else 0
+                stdscr.addstr(row, col, label, fa)
+                field_x = col + len(label)
+                if text:
+                    scroll = max(0, cur - FIELD_W + 1)
+                    display = text[scroll:scroll + FIELD_W].ljust(FIELD_W)
+                    field_attr = curses.A_REVERSE if is_focused else curses.A_UNDERLINE
+                    stdscr.addstr(row, field_x, display, field_attr)
+                    if is_focused:
+                        cursor_pos = (row, field_x + (cur - scroll))
+                elif placeholder:
+                    ph = placeholder[:FIELD_W].ljust(FIELD_W)
+                    stdscr.addstr(row, field_x, ph, curses.A_DIM | curses.A_UNDERLINE)
+                    if is_focused:
+                        cursor_pos = (row, field_x)
+                else:
+                    stdscr.addstr(row, field_x, " " * FIELD_W, curses.A_UNDERLINE)
+                    if is_focused:
+                        cursor_pos = (row, field_x)
+                # Hint after the input box
+                if hint:
+                    hint_x = field_x + FIELD_W + 2
+                    if hint_x + len(hint) < w - 1:
+                        stdscr.addstr(row, hint_x, hint, curses.A_DIM)
+            row += 1
+
+        if not fields:
+            # List tab: show worktrees table
+            if _all_worktrees:
+                for wt in _all_worktrees:
+                    branch = wt.get("branch", "")
+                    path = wt["path"]
+                    marker = "●" if wt.get("is_main") else "○"
+                    line = f"{marker} {branch or path.name}"
+                    try:
+                        stdscr.addstr(row, 4, line[:w - 6])
+                    except curses.error:
+                        pass
+                    row += 1
+                    try:
+                        stdscr.addstr(row, 6, str(path)[:w - 8], curses.A_DIM)
+                    except curses.error:
+                        pass
+                    row += 1
+            else:
+                stdscr.addstr(row, 4, "(no worktrees found)", curses.A_DIM)
+                row += 1
+
+        # Error message (shown when user tries to submit with missing required fields)
+        row += 1
+        if s.error:
+            stdscr.addstr(row, 2, s.error, curses.A_BOLD)
+        row += 1
+
+        # Preview
+        stdscr.addstr(row, 2, "─" * min(w - 4, 60), curses.A_DIM)
+        row += 1
+        preview = "$ git wt " + " ".join(build_argv())
+        stdscr.addstr(row, 2, preview[:w - 4], curses.A_BOLD)
+        row += 1
+        stdscr.addstr(row, 2, "─" * min(w - 4, 60), curses.A_DIM)
+        row += 1
+
+        # Help
+        stdscr.addstr(row, 2, "↑↓: next field   ←/→: cycle option   Space: toggle   Enter: run   Esc: quit", curses.A_DIM)
+
+        # Place hardware cursor
+        if cursor_pos:
+            curses.curs_set(1)
+            try:
+                stdscr.move(*cursor_pos)
+            except curses.error:
+                pass
+        else:
+            curses.curs_set(0)
+
+        stdscr.refresh()
+
+    def tui(stdscr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+
+        while True:
+            draw(stdscr)
+            key = stdscr.getch()
+
+            fields = cur_fields()
+            cur_field = fields[s.focus] if fields else None
+
+            if key == 27:  # Esc
+                return None
+
+            # Tab switching
+            elif key in (9, ord('['), ord(']')):    # Tab / [ / ]
+                direction = -1 if key == ord('[') else 1
+                s.tab = (s.tab + direction) % len(COMMANDS)
+                s.focus = 0
+                s.error = ""
+            elif key == curses.KEY_BTAB:            # Shift-Tab
+                s.tab = (s.tab - 1) % len(COMMANDS)
+                s.focus = 0
+                s.error = ""
+
+            # Field navigation
+            elif key == curses.KEY_DOWN:
+                if fields:
+                    s.focus = (s.focus + 1) % len(fields)
+            elif key == curses.KEY_UP:
+                if fields:
+                    s.focus = (s.focus - 1) % len(fields)
+
+            # Enter: validate + run
+            elif key in (10, 13):
+                def field_missing(f):
+                    _, _, is_cb, _, _, required = f
+                    if not required:
+                        return False
+                    if is_cb == "select":
+                        return not _removable
+                    if is_cb:
+                        return False
+                    return not getattr(s, f[0])
+                missing = [f for f in cur_fields() if field_missing(f)]
+                if missing:
+                    s.error = f"  {missing[0][1].strip()} is required"
+                    s.focus = cur_fields().index(missing[0])
+                else:
+                    return build_argv()
+
+            # Select field: ←/→ to cycle options
+            elif cur_field and cur_field[2] == "select":
+                if key == curses.KEY_LEFT and _removable:
+                    s.remove_pick = (s.remove_pick - 1) % len(_removable)
+                elif key == curses.KEY_RIGHT and _removable:
+                    s.remove_pick = (s.remove_pick + 1) % len(_removable)
+
+            # Space: toggle checkbox, or insert space in text field
+            elif key == ord(' '):
+                if cur_field and cur_field[2] is True:
+                    setattr(s, cur_field[0], not getattr(s, cur_field[0]))
+                elif cur_field and cur_field[2] != "select":
+                    s.error = ""
+                    handle_text_key(cur_field[0], key)
+
+            # Text input for focused text field
+            elif cur_field and not cur_field[2]:
+                s.error = ""
+                handle_text_key(cur_field[0], key)
+
+    return curses.wrapper(tui)
+
+
+# --- Main ---
+
+def main():
+    # Extract global pass-through flags before argparse sees them.
+    # --cd-file and --cmd-file are injected by the shell function for TUI mode
+    # and must survive subcommand dispatch without confusing argparse.
+    _cd_file = None
+    _cmd_file = None
+    filtered = []
+    for arg in sys.argv[1:]:
+        if arg.startswith("--cd-file="):
+            _cd_file = arg[len("--cd-file="):]
+        elif arg.startswith("--cmd-file="):
+            _cmd_file = arg[len("--cmd-file="):]
+        else:
+            filtered.append(arg)
+    sys.argv[1:] = filtered
+
+    _atuin_id = None  # set when we start an Atuin session to record TUI-produced commands
+
+    if len(sys.argv) == 1:
+        argv = run_tui()
+        if argv is None:
+            sys.exit(0)
+        sys.argv[1:] = argv
+        expanded = "git wt " + " ".join(argv)
+        print(f"$ {expanded}")
+        if _cmd_file:
+            # Shell function is present — it will handle history injection
+            try:
+                Path(_cmd_file).write_text(expanded)
+            except Exception:
+                pass
+        else:
+            # Direct invocation (git wt) — inject into Atuin ourselves if available
+            try:
+                result = subprocess.run(
+                    ["atuin", "history", "start", "--", expanded],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    _atuin_id = result.stdout.strip()
+            except FileNotFoundError:
+                pass  # atuin not installed
+        # Re-inject --cd-file for commands that support it, produced by TUI
+        if _cd_file and sys.argv[1] in ("create", "switch"):
+            sys.argv.append(f"--cd-file={_cd_file}")
+
+    parser = argparse.ArgumentParser(
+        prog="git-wt",
+        description="Git worktree manager with IDE and dependency setup"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Create command
+    create_parser = subparsers.add_parser("create", help="Create a new worktree")
+    create_parser.add_argument("branch", help="Branch name")
+    create_parser.add_argument("--path", help="Custom worktree path")
+    create_parser.add_argument("--base", help="Base ref for new branch")
+    create_parser.add_argument("--no-install", action="store_true", help="Skip dependency installation")
+    create_parser.add_argument("--no-open", action="store_true", help="Don't open editor")
+    create_parser.add_argument("--no-ide", action="store_true", help="Skip IDE configuration")
+    create_parser.add_argument("--copy-env", action="store_true", help="Copy .env files instead of symlinking")
+    create_parser.add_argument("--editor", help="Editor command to use")
+    create_parser.add_argument("--no-cd", action="store_true", help="Don't cd into the new worktree after creation")
+    create_parser.add_argument("--cd-file", help=argparse.SUPPRESS)  # used by shell integration
+
+    # Destroy command
+    remove_parser = subparsers.add_parser("remove", help="Remove a worktree")
+    remove_parser.add_argument("path_or_branch", help="Worktree path or branch name")
+    remove_parser.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+
+    # Switch command
+    switch_parser = subparsers.add_parser("switch", help="Switch to a worktree by partial name ('-' for main)")
+    switch_parser.add_argument("name", help="Partial branch name, path fragment, or '-' for main worktree")
+    switch_parser.add_argument("--cd-file", help=argparse.SUPPRESS)  # used by shell integration
+
+    # List command
+    subparsers.add_parser("list", help="List all worktrees")
+
+    # Shell-init command
+    subparsers.add_parser("shell-init", help="Print shell integration for eval in .zshrc / .bashrc")
+
+    # Shorthand: bare name/"-" not matching a subcommand → treat as "switch <name>"
+    KNOWN_COMMANDS = {"create", "remove", "list", "switch", "shell-init"}
+    if (len(sys.argv) > 1
+            and sys.argv[1] not in KNOWN_COMMANDS
+            and (sys.argv[1] == "-" or not sys.argv[1].startswith("-"))):
+        sys.argv[1:] = ["switch"] + sys.argv[1:]
+        if _cd_file:
+            sys.argv.append(f"--cd-file={_cd_file}")
+            _cd_file = None  # consumed
+
+    args = parser.parse_args()
+    config = Config()
+
+    _exit_code = 0
+    try:
+        if args.command == "create":
+            cmd_create(args, config)
+        elif args.command == "remove":
+            cmd_remove(args, config)
+        elif args.command == "switch":
+            cmd_switch(args)
+        elif args.command == "list":
+            cmd_list(args)
+        elif args.command == "shell-init":
+            cmd_shell_init()
+    except SystemExit as e:
+        _exit_code = e.code if isinstance(e.code, int) else 1
+        raise
+    finally:
+        if _atuin_id:
+            try:
+                subprocess.run(
+                    ["atuin", "history", "end", "--exit", str(_exit_code), _atuin_id],
+                    capture_output=True,
+                )
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()

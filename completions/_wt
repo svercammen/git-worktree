@@ -1,0 +1,51 @@
+#compdef wt
+
+# Zsh completion for the wt shell function (git-wt integration).
+# Install: add the following to ~/.zshrc BEFORE compinit:
+#   fpath=(~/bin/completions $fpath)
+
+_wt_branches() {
+  git worktree list --porcelain 2>/dev/null \
+    | awk '/^branch / { gsub("refs/heads/", "", $2); print $2 }'
+  echo -
+}
+
+_wt_worktrees() {
+  local -a branches
+  branches=($(_wt_branches))
+  # l:|=* r:|=* enables substring/fuzzy matching: "feat" matches "feature/my-branch"
+  compadd -M 'l:|=* r:|=*' -a branches
+}
+
+_wt() {
+  local -a subcommands
+  subcommands=(
+    'create:create a new worktree'
+    'remove:remove a worktree'
+    'switch:switch to a worktree by partial name'
+    'list:list all worktrees'
+    'shell-init:print shell integration code for .zshrc'
+  )
+
+  case $CURRENT in
+    2)
+      _describe 'subcommand' subcommands
+      _wt_worktrees
+      ;;
+    3)
+      case ${words[2]} in
+        switch|remove) _wt_worktrees ;;
+      esac
+      ;;
+  esac
+}
+
+# fzf ** trigger: `wt switch **<Tab>` or `wt **<Tab>` opens an interactive fzf picker.
+# Requires fzf shell integration (source ~/.fzf.zsh or equivalent).
+_fzf_complete_wt() {
+  _fzf_complete --prompt='worktree> ' --height 40% --reverse --border -- "$@" < <(
+    _wt_branches
+  )
+}
+
+_wt "$@"
