@@ -10,6 +10,14 @@ _wt_branches() {
   echo -
 }
 
+# Branches of linked (non-main) worktrees — candidates for `remove`.
+_wt_removable_branches() {
+  git worktree list --porcelain 2>/dev/null | awk '
+    /^worktree / { wt++ }
+    /^branch / && wt > 1 { gsub("refs/heads/", "", $2); print $2 }
+  '
+}
+
 _wt_worktrees() {
   local -a branches
   branches=($(_wt_branches))
@@ -17,25 +25,51 @@ _wt_worktrees() {
   compadd -M 'l:|=* r:|=*' -a branches
 }
 
+# Complete a remove target: exclude the main worktree and any branches already
+# listed earlier on the command line so tab-cycle doesn't re-suggest them.
+_wt_remove_targets() {
+  local -a branches already filtered
+  branches=($(_wt_removable_branches))
+  # Already-typed remove args (between the subcommand and the word at cursor)
+  if (( CURRENT > 3 )); then
+    already=("${(@)words[3,CURRENT-1]}")
+  fi
+  local b arg skip
+  for b in "${branches[@]}"; do
+    skip=0
+    for arg in "${already[@]}"; do
+      if [[ "$b" == "$arg" ]]; then
+        skip=1
+        break
+      fi
+    done
+    (( skip )) || filtered+=("$b")
+  done
+  compadd -M 'l:|=* r:|=*' -a filtered
+}
+
 _wt() {
   local -a subcommands
   subcommands=(
     'create:create a new worktree'
-    'remove:remove a worktree'
+    'remove:remove one or more worktrees'
     'switch:switch to a worktree by partial name'
     'list:list all worktrees'
     'shell-init:print shell integration code for .zshrc'
   )
 
-  case $CURRENT in
-    2)
-      _describe 'subcommand' subcommands
-      _wt_worktrees
+  if (( CURRENT == 2 )); then
+    _describe 'subcommand' subcommands
+    _wt_worktrees
+    return
+  fi
+
+  case ${words[2]} in
+    switch)
+      (( CURRENT == 3 )) && _wt_worktrees
       ;;
-    3)
-      case ${words[2]} in
-        switch|remove) _wt_worktrees ;;
-      esac
+    remove)
+      _wt_remove_targets
       ;;
   esac
 }

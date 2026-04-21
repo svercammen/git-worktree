@@ -40,9 +40,10 @@ The `wt()` shell function wraps `git wt` to enable:
 
 ### TUI (curses)
 - `run_tui()` returns a list of argv tokens or None on cancel
-- Field types: `False` = text input, `True` = checkbox, `"select"` = ←/→ picker
-- Tab/Shift-Tab switch tabs; ↑/↓ navigate fields; Enter always runs (never toggles)
+- Field types: `False` = text input, `True` = checkbox, `"select"` = ←/→ picker, `"multi"` = vertical list with Space toggle (↑/↓ moves cursor, wrapping to adjacent fields at boundaries)
+- Tab/Shift-Tab switch tabs; ↑/↓ navigate fields (or within a focused multi-select); Enter always runs (never toggles)
 - Worktrees fetched once via `get_worktrees()` at TUI start
+- `remove` accepts multiple targets — the TUI emits all checked branches into argv; the CLI resolves each, confirms once, then loops removal
 
 ### Worktree path resolution
 `resolve_worktree(name, config)` tries: direct path → git worktree list branch match → computed config path (catches orphaned dirs not registered with git).

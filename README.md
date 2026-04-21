@@ -81,10 +81,13 @@ Creates a new worktree, installs dependencies, sets up IDE config, symlinks `.en
 
 ```zsh
 wt remove <branch>
-wt remove <branch> --force   # skip confirmation prompt
+wt remove <branch1> <branch2> <path/to/wt3>   # remove multiple at once
+wt remove <branch> --force                    # skip confirmation prompt
 ```
 
-Cleans up virtual environments and `node_modules` before removing. Handles orphaned directories (path exists on disk but not registered with git).
+Cleans up virtual environments and `node_modules` before removing. Handles orphaned directories (path exists on disk but not registered with git). With multiple targets, a single confirmation prompt lists them all; each is removed independently and failures on one don't abort the rest.
+
+In the TUI's `remove` tab, use `↑`/`↓` to move the cursor through the worktree list and `Space` to toggle selection. Tab completion also supports multiple arguments and filters out worktrees already typed on the command line.
 
 ### List worktrees
 

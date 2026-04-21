@@ -966,16 +966,33 @@ wt() {
 
 
 def cmd_remove(args, config):
-    """Destroy a worktree and clean up its environment."""
-    # Resolve worktree path
-    worktree_path = resolve_worktree(args.path_or_branch, config)
-    if not worktree_path:
-        print(f"Error: Worktree '{args.path_or_branch}' not found", file=sys.stderr)
-        sys.exit(1)
+    """Destroy one or more worktrees and clean up their environments."""
+    # Resolve all targets first; fail fast if any is unknown
+    resolved: List[Path] = []
+    for target in args.targets:
+        worktree_path = resolve_worktree(target, config)
+        if not worktree_path:
+            print(f"Error: Worktree '{target}' not found", file=sys.stderr)
+            sys.exit(1)
+        resolved.append(worktree_path)
 
-    # Confirm unless --force
+    # Deduplicate while preserving order (user may type same branch + path, etc.)
+    seen: Set[Path] = set()
+    unique: List[Path] = []
+    for p in resolved:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+
+    # Confirm once unless --force
     if not args.force:
-        response = input(f"Destroy worktree at {worktree_path}? [y/N] ")
+        if len(unique) == 1:
+            response = input(f"Destroy worktree at {unique[0]}? [y/N] ")
+        else:
+            print("Destroy the following worktrees:")
+            for p in unique:
+                print(f"  {p}")
+            response = input(f"Proceed with removal of {len(unique)} worktrees? [y/N] ")
         if response.lower() != "y":
             print("Cancelled")
             return
@@ -990,33 +1007,38 @@ def cmd_remove(args, config):
         )
         sys.exit(1)
 
-    print(f"Destroying worktree at {worktree_path}...")
+    failures = 0
+    for worktree_path in unique:
+        print(f"\nDestroying worktree at {worktree_path}...")
 
-    # Remove worktree-specific SDKs from JetBrains global SDK table
+        try:
+            unregister_jetbrains_sdks(worktree_path)
+        except Exception as e:
+            print(f"Warning: Failed to clean up JetBrains SDKs: {e}", file=sys.stderr)
+
+        for venv in worktree_path.glob("*/.venv"):
+            if venv.is_dir():
+                print(f"Removing {venv}...")
+                shutil.rmtree(venv)
+
+        for nm in worktree_path.glob("*/node_modules"):
+            if nm.is_dir():
+                print(f"Removing {nm}...")
+                shutil.rmtree(nm)
+
+        try:
+            run_cmd(["git", "worktree", "remove", str(worktree_path), "--force"])
+            print(f"✓ Worktree removed: {worktree_path}")
+        except Exception as e:
+            print(f"Error: Failed to remove worktree {worktree_path}: {e}", file=sys.stderr)
+            failures += 1
+
     try:
-        unregister_jetbrains_sdks(worktree_path)
-    except Exception as e:
-        print(f"Warning: Failed to clean up JetBrains SDKs: {e}", file=sys.stderr)
-
-    # Remove .venv directories
-    for venv in worktree_path.glob("*/.venv"):
-        if venv.is_dir():
-            print(f"Removing {venv}...")
-            shutil.rmtree(venv)
-
-    # Remove node_modules directories
-    for nm in worktree_path.glob("*/node_modules"):
-        if nm.is_dir():
-            print(f"Removing {nm}...")
-            shutil.rmtree(nm)
-
-    # Remove worktree (always --force since user already confirmed or passed --force)
-    try:
-        run_cmd(["git", "worktree", "remove", str(worktree_path), "--force"])
         run_cmd(["git", "worktree", "prune"])
-        print(f"✓ Worktree removed")
-    except Exception as e:
-        print(f"Error: Failed to remove worktree: {e}", file=sys.stderr)
+    except Exception:
+        pass
+
+    if failures:
         sys.exit(1)
 
 
@@ -1172,7 +1194,8 @@ def run_tui() -> Optional[List[str]]:
             self.no_ide     = False
             self.copy_env   = False
             # remove
-            self.remove_pick = 0  # index into _removable
+            self.remove_pick = 0  # cursor position in _removable
+            self.remove_selected: Set[int] = set()  # indices of checked worktrees
             self.force = False
 
     # Resolve default base for the Base field placeholder
@@ -1190,7 +1213,8 @@ def run_tui() -> Optional[List[str]]:
     _removable = [wt for wt in _all_worktrees if not wt.get("is_main")]
 
     # (attr, label, is_cb, hint, placeholder, required)
-    # is_cb: False = text input, True = checkbox, "select" = ←/→ option picker
+    # is_cb: False = text input, True = checkbox,
+    #        "select" = ←/→ option picker, "multi" = ↑/↓ list with Space to toggle
     CREATE_FIELDS = [
         ("branch",       "Branch:       ", False,    "name for the new branch",                   "",                 True),
         ("base",         "Base:         ", False,    "branch name, HEAD, or commit SHA",           _base_placeholder,  False),
@@ -1201,8 +1225,8 @@ def run_tui() -> Optional[List[str]]:
         ("copy_env",     "--copy-env    ", True,     "copy .env files instead of symlinking",      "",                 False),
     ]
     REMOVE_FIELDS = [
-        ("remove_pick", "Worktree:     ", "select",  "←/→ to cycle",             "", True),
-        ("force",        "--force       ", True,      "skip confirmation prompt",  "", False),
+        ("remove_selected", "Worktrees:    ", "multi",  "Space: toggle, ↑↓: move",   "", True),
+        ("force",           "--force       ", True,     "skip confirmation prompt",  "", False),
     ]
     LIST_FIELDS: list = []
     FIELDS_BY_TAB = [CREATE_FIELDS, REMOVE_FIELDS, LIST_FIELDS]
@@ -1225,9 +1249,10 @@ def run_tui() -> Optional[List[str]]:
             if s.copy_env:    parts.append("--copy-env")
         elif cmd == "remove":
             parts = ["remove"]
-            if _removable:
-                wt = _removable[s.remove_pick]
-                parts.append(wt.get("branch") or str(wt["path"]))
+            for idx in sorted(s.remove_selected):
+                if idx < len(_removable):
+                    wt = _removable[idx]
+                    parts.append(wt.get("branch") or str(wt["path"]))
             if s.force:   parts.append("--force")
         else:
             parts = ["list"]
@@ -1285,8 +1310,10 @@ def run_tui() -> Optional[List[str]]:
         fields = cur_fields()
         for i, (attr, label, is_cb, hint, placeholder, required) in enumerate(fields):
             is_focused = (i == s.focus)
-            # is_missing: text fields only; select fields missing if no options
-            if required and is_cb == "select":
+            # is_missing: text fields only; selectors missing if nothing picked
+            if required and is_cb == "multi":
+                is_missing = not s.remove_selected
+            elif required and is_cb == "select":
                 is_missing = not _removable
             elif required and not is_cb:
                 is_missing = not getattr(s, attr)
@@ -1299,7 +1326,40 @@ def run_tui() -> Optional[List[str]]:
                 marker_attr = curses.A_BOLD if is_missing else curses.A_DIM
                 stdscr.addstr(row, 2, "*", marker_attr)
 
-            if is_cb == "select":
+            if is_cb == "multi":
+                fa = curses.A_BOLD if is_focused else 0
+                stdscr.addstr(row, col, label, fa)
+                summary_x = col + len(label)
+                if not _removable:
+                    stdscr.addstr(row, summary_x, "(no linked worktrees)", curses.A_DIM)
+                    row += 1
+                else:
+                    n = len(_removable)
+                    selected_n = len(s.remove_selected)
+                    stdscr.addstr(row, summary_x, f"{selected_n}/{n} selected", curses.A_DIM)
+                    if hint and is_focused:
+                        hint_x = summary_x + len(f"{selected_n}/{n} selected") + 3
+                        if hint_x + len(hint) < w - 1:
+                            stdscr.addstr(row, hint_x, hint, curses.A_DIM)
+                    row += 1
+                    for idx, wt in enumerate(_removable):
+                        if row >= h - 5:  # leave room for preview + help
+                            stdscr.addstr(row, col + 2, f"… {n - idx} more (resize terminal)", curses.A_DIM)
+                            row += 1
+                            break
+                        val = wt.get("branch") or str(wt["path"].name)
+                        checked = "[x]" if idx in s.remove_selected else "[ ]"
+                        at_cursor = is_focused and idx == s.remove_pick
+                        marker = "▶" if at_cursor else " "
+                        line = f"{marker} {checked} {val}"
+                        line_attr = curses.A_REVERSE if at_cursor else 0
+                        try:
+                            stdscr.addstr(row, col + 2, line[:w - col - 4], line_attr)
+                        except curses.error:
+                            pass
+                        row += 1
+                continue  # skip the default row += 1 below
+            elif is_cb == "select":
                 fa = curses.A_BOLD if is_focused else 0
                 stdscr.addstr(row, col, label, fa)
                 field_x = col + len(label)
@@ -1429,12 +1489,23 @@ def run_tui() -> Optional[List[str]]:
                 s.focus = 0
                 s.error = ""
 
-            # Field navigation
+            # Field navigation — multi-select captures ↑/↓ to move within its list,
+            # wrapping to adjacent fields at the top/bottom.
             elif key == curses.KEY_DOWN:
-                if fields:
+                if cur_field and cur_field[2] == "multi" and _removable:
+                    if s.remove_pick < len(_removable) - 1:
+                        s.remove_pick += 1
+                    else:
+                        s.focus = (s.focus + 1) % len(fields)
+                elif fields:
                     s.focus = (s.focus + 1) % len(fields)
             elif key == curses.KEY_UP:
-                if fields:
+                if cur_field and cur_field[2] == "multi" and _removable:
+                    if s.remove_pick > 0:
+                        s.remove_pick -= 1
+                    else:
+                        s.focus = (s.focus - 1) % len(fields)
+                elif fields:
                     s.focus = (s.focus - 1) % len(fields)
 
             # Enter: validate + run
@@ -1443,6 +1514,8 @@ def run_tui() -> Optional[List[str]]:
                     _, _, is_cb, _, _, required = f
                     if not required:
                         return False
+                    if is_cb == "multi":
+                        return not s.remove_selected
                     if is_cb == "select":
                         return not _removable
                     if is_cb:
@@ -1450,7 +1523,11 @@ def run_tui() -> Optional[List[str]]:
                     return not getattr(s, f[0])
                 missing = [f for f in cur_fields() if field_missing(f)]
                 if missing:
-                    s.error = f"  {missing[0][1].strip()} is required"
+                    label_text = missing[0][1].strip().rstrip(":")
+                    if missing[0][2] == "multi":
+                        s.error = f"  select at least one {label_text.lower().rstrip('s')}"
+                    else:
+                        s.error = f"  {label_text} is required"
                     s.focus = cur_fields().index(missing[0])
                 else:
                     return build_argv()
@@ -1462,9 +1539,15 @@ def run_tui() -> Optional[List[str]]:
                 elif key == curses.KEY_RIGHT and _removable:
                     s.remove_pick = (s.remove_pick + 1) % len(_removable)
 
-            # Space: toggle checkbox, or insert space in text field
+            # Space: toggle multi-select item, checkbox, or insert space in text field
             elif key == ord(' '):
-                if cur_field and cur_field[2] is True:
+                if cur_field and cur_field[2] == "multi" and _removable:
+                    s.error = ""
+                    if s.remove_pick in s.remove_selected:
+                        s.remove_selected.discard(s.remove_pick)
+                    else:
+                        s.remove_selected.add(s.remove_pick)
+                elif cur_field and cur_field[2] is True:
                     setattr(s, cur_field[0], not getattr(s, cur_field[0]))
                 elif cur_field and cur_field[2] != "select":
                     s.error = ""
@@ -1546,8 +1629,11 @@ def main():
     create_parser.add_argument("--cd-file", help=argparse.SUPPRESS)  # used by shell integration
 
     # Destroy command
-    remove_parser = subparsers.add_parser("remove", help="Remove a worktree")
-    remove_parser.add_argument("path_or_branch", help="Worktree path or branch name")
+    remove_parser = subparsers.add_parser("remove", help="Remove one or more worktrees")
+    remove_parser.add_argument(
+        "targets", nargs="+", metavar="PATH_OR_BRANCH",
+        help="One or more worktree paths or branch names",
+    )
     remove_parser.add_argument("--force", action="store_true", help="Skip confirmation prompt")
 
     # Switch command
