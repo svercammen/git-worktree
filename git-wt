@@ -243,12 +243,26 @@ def get_source_python(source_path: Path, project_name: str) -> Optional[str]:
     source_project = source_path / project_name
     if not source_project.exists():
         return None
+
+    import re as _re
+
+    # Prefer an in-project .venv if present. Poetry may not know about it
+    # (e.g. it was created manually, or global virtualenvs.in-project=false and
+    # no local poetry.toml exists), in which case `poetry env info` fails — but
+    # the user's day-to-day interpreter is still what the IDE is configured for.
+    in_project_python = source_project / ".venv" / "bin" / "python"
+    if in_project_python.exists():
+        ver_result = run_cmd([str(in_project_python), "--version"], check=False)
+        if ver_result.returncode == 0:
+            ver_m = _re.match(r'Python (\d+\.\d+)', ver_result.stdout.strip())
+            if ver_m:
+                return f"python{ver_m.group(1)}"
+
     try:
         result = run_cmd(["poetry", "env", "info", "--executable"], cwd=source_project, check=False)
         if result.returncode == 0:
             executable = result.stdout.strip()
             real = Path(executable).resolve()
-            import re as _re
             # Check centralized venv path suffix like "-py3.13"
             m = _re.search(r'-py(\d+\.\d+)', str(real))
             if m:
@@ -821,7 +835,7 @@ def cmd_create(args, config: Config):
         worktree_path = Path(args.path).resolve()
     else:
         base_dir = config.base_dir.replace("{repo}", get_repo_name())
-        base_path = source_path / base_dir
+        base_path = (source_path / base_dir).resolve()
         base_path.mkdir(parents=True, exist_ok=True)
         worktree_path = base_path / branch.replace("/", "-")
 
