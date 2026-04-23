@@ -86,32 +86,46 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None, capture: bool = True, ch
 
 
 def get_git_root() -> Path:
-    """Get the root directory of the git repository."""
+    """Get the root directory of the current worktree."""
     result = run_cmd(["git", "rev-parse", "--show-toplevel"])
     return Path(result.stdout.strip())
 
 
+def get_main_worktree_root() -> Path:
+    """Return the main worktree's root directory, even when called from a linked worktree.
+
+    Uses git-common-dir (which points at the shared .git) to find the main worktree,
+    so base_dir resolution doesn't nest paths under the current worktree.
+    """
+    result = run_cmd(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    common_dir = Path(result.stdout.strip())
+    if common_dir.name == ".git":
+        return common_dir.parent
+    return get_git_root()
+
+
 def get_repo_name() -> str:
-    """Get the repository name."""
-    git_root = get_git_root()
-    return git_root.name
+    """Get the repository name from the main worktree directory."""
+    return get_main_worktree_root().name
 
 
-def default_base() -> str:
-    """Return the best default base branch: main > master > HEAD."""
-    for candidate in ("main", "master"):
-        if branch_exists(candidate):
-            return candidate
-    return "HEAD"
-
-
-def branch_exists(branch: str) -> bool:
-    """Check if a branch exists locally or remotely."""
+def branch_exists_where(branch: str) -> Optional[str]:
+    """Return 'local', 'remote', or None."""
     result = run_cmd(["git", "rev-parse", "--verify", branch], check=False)
     if result.returncode == 0:
-        return True
+        return "local"
     result = run_cmd(["git", "rev-parse", "--verify", f"origin/{branch}"], check=False)
-    return result.returncode == 0
+    if result.returncode == 0:
+        return "remote"
+    return None
+
+
+def find_worktree_for_branch(branch: str) -> Optional[Path]:
+    """Return the path of the worktree where branch is checked out, or None."""
+    for wt in get_worktrees():
+        if wt.get("branch") == branch:
+            return wt["path"]
+    return None
 
 
 # --- Project Detection ---
@@ -813,21 +827,44 @@ def open_editor(editor_cmd: str, worktree_path: Path):
 
 def cmd_create(args, config: Config):
     """Create a new worktree with full environment setup."""
-    # Validate we're in a git repo
+    # Always anchor to the main worktree root so base_dir doesn't nest paths
+    # when cmd_create is invoked from inside a linked worktree.
     try:
-        source_path = get_git_root()
-    except:
+        source_path = get_main_worktree_root()
+    except Exception:
         print("Error: Not in a git repository", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve branch
-    branch = args.branch
-    if not branch_exists(branch):
-        base = args.base or default_base()
-        print(f"Creating new branch '{branch}' from '{base}'...")
+    name = args.name
+    branch = args.branch or name
+
+    # Resolve branch: existing → fetch if remote → create from main
+    existence = branch_exists_where(branch)
+    if existence is None:
+        ls_remote = run_cmd(["git", "ls-remote", "--heads", "origin", branch], check=False)
+        if ls_remote.returncode != 0:
+            print("Warning: could not reach origin, proceeding with local state", file=sys.stderr)
+        elif ls_remote.stdout.strip():
+            print(f"Branch '{branch}' exists on origin — fetching...")
+            fetch_result = run_cmd(["git", "fetch", "origin", branch], check=False)
+            if fetch_result.returncode != 0:
+                print("Warning: fetch failed, proceeding with local state", file=sys.stderr)
+            existence = branch_exists_where(branch)
+
+    if existence is None:
+        print(f"Creating new branch '{branch}' from 'main'...")
         try:
-            run_cmd(["git", "branch", branch, base])
+            run_cmd(["git", "branch", branch, "main"])
         except subprocess.CalledProcessError:
+            sys.exit(1)
+    else:
+        occupying = find_worktree_for_branch(branch)
+        if occupying is not None:
+            print(
+                f"Error: branch '{branch}' is already checked out at {occupying}.\n"
+                f"Use `wt {branch}` to switch, or pick a different branch.",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
     # Resolve worktree path
@@ -837,7 +874,7 @@ def cmd_create(args, config: Config):
         base_dir = config.base_dir.replace("{repo}", get_repo_name())
         base_path = (source_path / base_dir).resolve()
         base_path.mkdir(parents=True, exist_ok=True)
-        worktree_path = base_path / branch.replace("/", "-")
+        worktree_path = base_path / name.replace("/", "-")
 
     if worktree_path.exists():
         # Check if it's an orphaned directory (not registered as a git worktree)
@@ -1170,7 +1207,7 @@ def resolve_worktree(path_or_branch: str, config: Optional["Config"] = None) -> 
     # Fall back to the computed path based on config (catches orphaned/unregistered dirs)
     if config is not None:
         try:
-            source_path = get_git_root().parent
+            source_path = get_main_worktree_root()
             base_dir = config.base_dir.replace("{repo}", get_repo_name())
             computed = (source_path / base_dir / path_or_branch.replace("/", "-")).resolve()
             if computed.exists():
@@ -1186,7 +1223,7 @@ def resolve_worktree(path_or_branch: str, config: Optional["Config"] = None) -> 
 def run_tui() -> Optional[List[str]]:
     """Show an interactive TUI when invoked with no arguments.
 
-    Returns a list of argv tokens (e.g. ["create", "my-branch", "--base", "main"])
+    Returns a list of argv tokens (e.g. ["create", "my-worktree", "--branch", "feature/foo"])
     to inject into sys.argv before argparse runs, or None if the user cancelled.
     """
     import curses
@@ -1200,8 +1237,8 @@ def run_tui() -> Optional[List[str]]:
             self.focus = 0
             self.error = ""
             # create
+            self.name = "";       self.name_cur = 0
             self.branch = "";     self.branch_cur = 0
-            self.base = "";       self.base_cur = 0
             self.no_install = False
             self.no_open  = False
             self.no_cd      = False
@@ -1211,13 +1248,6 @@ def run_tui() -> Optional[List[str]]:
             self.remove_pick = 0  # cursor position in _removable
             self.remove_selected: Set[int] = set()  # indices of checked worktrees
             self.force = False
-
-    # Resolve default base for the Base field placeholder
-    try:
-        _default_base = default_base()
-    except Exception:
-        _default_base = "HEAD"
-    _base_placeholder = f"{_default_base} (if omitted)"
 
     # Fetch worktrees once for remove picker and list tab
     try:
@@ -1230,13 +1260,13 @@ def run_tui() -> Optional[List[str]]:
     # is_cb: False = text input, True = checkbox,
     #        "select" = ←/→ option picker, "multi" = ↑/↓ list with Space to toggle
     CREATE_FIELDS = [
-        ("branch",       "Branch:       ", False,    "name for the new branch",                   "",                 True),
-        ("base",         "Base:         ", False,    "branch name, HEAD, or commit SHA",           _base_placeholder,  False),
-        ("no_install",   "--no-install  ", True,     "skip dependency installation",               "",                 False),
-        ("no_open",      "--no-open     ", True,     "don't launch the editor after create",       "",                 False),
-        ("no_cd",        "--no-cd       ", True,     "don't cd into the worktree after creation",  "",                 False),
-        ("no_ide",       "--no-ide      ", True,     "skip IDE configuration",                     "",                 False),
-        ("copy_env",     "--copy-env    ", True,     "copy .env files instead of symlinking",      "",                 False),
+        ("name",         "Name:         ", False,    "worktree directory name",                    "",                     True),
+        ("branch",       "Branch:       ", False,    "branch to check out",                        "<name> (if omitted)",  False),
+        ("no_install",   "--no-install  ", True,     "skip dependency installation",               "",                     False),
+        ("no_open",      "--no-open     ", True,     "don't launch the editor after create",       "",                     False),
+        ("no_cd",        "--no-cd       ", True,     "don't cd into the worktree after creation",  "",                     False),
+        ("no_ide",       "--no-ide      ", True,     "skip IDE configuration",                     "",                     False),
+        ("copy_env",     "--copy-env    ", True,     "copy .env files instead of symlinking",      "",                     False),
     ]
     REMOVE_FIELDS = [
         ("remove_selected", "Worktrees:    ", "multi",  "Space: toggle, ↑↓: move",   "", True),
@@ -1254,8 +1284,8 @@ def run_tui() -> Optional[List[str]]:
         cmd = COMMANDS[s.tab]
         if cmd == "create":
             parts: List[str] = ["create"]
-            if s.branch:      parts.append(s.branch)
-            if s.base:        parts += ["--base", s.base]
+            if s.name:        parts.append(s.name)
+            if s.branch:      parts += ["--branch", s.branch]
             if s.no_install:  parts.append("--no-install")
             if s.no_open:     parts.append("--no-open")
             if s.no_cd:       parts.append("--no-cd")
@@ -1631,9 +1661,9 @@ def main():
 
     # Create command
     create_parser = subparsers.add_parser("create", help="Create a new worktree")
-    create_parser.add_argument("branch", help="Branch name")
+    create_parser.add_argument("name", help="Worktree directory name (slashes are replaced with dashes)")
+    create_parser.add_argument("--branch", help="Branch to check out (defaults to the worktree name)")
     create_parser.add_argument("--path", help="Custom worktree path")
-    create_parser.add_argument("--base", help="Base ref for new branch")
     create_parser.add_argument("--no-install", action="store_true", help="Skip dependency installation")
     create_parser.add_argument("--no-open", action="store_true", help="Don't open editor")
     create_parser.add_argument("--no-ide", action="store_true", help="Skip IDE configuration")
