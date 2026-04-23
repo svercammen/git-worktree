@@ -346,6 +346,14 @@ def pick_compatible_python(constraint: str) -> Optional[str]:
     return None
 
 
+def suggest_python_minor(constraint: str) -> Optional[str]:
+    """Return a 'X.Y' version that satisfies the constraint, ignoring what's installed."""
+    for minor in range(20, 7, -1):
+        if python_cmd_satisfies(f"python3.{minor}", constraint):
+            return f"3.{minor}"
+    return None
+
+
 def get_source_python(source_path: Path, project_name: str) -> Optional[str]:
     """Get the Python executable used by a Poetry project in the source worktree."""
     source_project = source_path / project_name
@@ -394,6 +402,51 @@ def install_dependencies(worktree_path: Path, projects: List[Project], source_pa
 
     venv_paths = {}
 
+    # Pre-flight: resolve the Python interpreter for every Poetry project up-front.
+    # If any project's constraint can't be satisfied by an installed python3.X, abort
+    # with install instructions before touching any project.
+    plan: Dict[str, tuple[Optional[str], str]] = {}
+    missing: List[tuple[str, str, Optional[str]]] = []  # (project_name, constraint, source_python)
+    for project in sorted_poetry:
+        project_dir = worktree_path / project.name
+        source_python = get_source_python(source_path, project.name) if source_path else None
+        constraint = get_python_constraint(project_dir)
+
+        if source_python and (not constraint or python_cmd_satisfies(source_python, constraint)):
+            plan[project.name] = (source_python, "matching source worktree")
+            continue
+        if not constraint:
+            plan[project.name] = (None, "")
+            continue
+        pick = pick_compatible_python(constraint)
+        if pick:
+            reason = (
+                f"source {source_python} incompatible with {constraint}"
+                if source_python else f"satisfies {constraint}"
+            )
+            plan[project.name] = (pick, reason)
+        else:
+            missing.append((project.name, constraint, source_python))
+
+    if missing:
+        print("Error: no compatible Python found for one or more projects:", file=sys.stderr)
+        suggested_minors = set()
+        for name, constraint, src in missing:
+            src_note = f"; source uses {src}" if src else ""
+            print(f"  - {name}: requires {constraint}{src_note}", file=sys.stderr)
+            s = suggest_python_minor(constraint)
+            if s:
+                suggested_minors.add(s)
+        if suggested_minors:
+            versions = ", ".join(sorted(suggested_minors))
+            print(f"\nInstall a compatible Python ({versions}) via one of:", file=sys.stderr)
+            for v in sorted(suggested_minors):
+                print(f"  brew install python@{v}", file=sys.stderr)
+            for v in sorted(suggested_minors):
+                print(f"  pyenv install {v} && pyenv rehash", file=sys.stderr)
+            print("\nThen re-run `git wt create` (existing worktree will be reused).", file=sys.stderr)
+        sys.exit(1)
+
     # Install Poetry projects in dependency order
     for project in sorted_poetry:
         print(f"Installing Poetry dependencies for {project.name}...")
@@ -403,33 +456,7 @@ def install_dependencies(worktree_path: Path, projects: List[Project], source_pa
             # Ensure in-project venvs (creates poetry.toml if not present)
             run_cmd(["poetry", "config", "--local", "virtualenvs.in-project", "true"], cwd=project_dir)
 
-            # Pick a Python that satisfies the project's pyproject.toml constraint.
-            # Prefer the source worktree's Python when compatible; otherwise fall
-            # back to the highest installed python3.X that satisfies.
-            source_python = get_source_python(source_path, project.name) if source_path else None
-            constraint = get_python_constraint(project_dir)
-            python_cmd: Optional[str] = None
-            reason = ""
-
-            if source_python and (not constraint or python_cmd_satisfies(source_python, constraint)):
-                python_cmd = source_python
-                reason = "matching source worktree"
-            elif constraint:
-                pick = pick_compatible_python(constraint)
-                if pick:
-                    python_cmd = pick
-                    reason = (
-                        f"source {source_python} incompatible with {constraint}"
-                        if source_python
-                        else f"satisfies {constraint}"
-                    )
-                elif source_python:
-                    print(
-                        f"  → source uses {source_python}, incompatible with {project.name} ({constraint}); "
-                        f"no alternative python3.X found on PATH.",
-                        file=sys.stderr,
-                    )
-
+            python_cmd, reason = plan[project.name]
             if python_cmd:
                 print(f"  → using {python_cmd} ({reason})")
                 run_cmd(["poetry", "env", "use", python_cmd], cwd=project_dir)
@@ -915,10 +942,25 @@ def handle_tfvars_files(source_path: Path, worktree_path: Path, copy: bool = Fal
     if not tfvars_files:
         return
 
+    # Skip tracked files — the worktree already has the committed copy,
+    # and replacing it with a symlink would show as a type-change in git status.
+    untracked = []
+    for tfvars_file in tfvars_files:
+        check = run_cmd(
+            ["git", "ls-files", "--error-unmatch", tfvars_file.name],
+            cwd=terraform_source,
+            check=False,
+        )
+        if check.returncode != 0:
+            untracked.append(tfvars_file)
+
+    if not untracked:
+        return
+
     print(f"{'Copying' if copy else 'Symlinking'} .tfvars files...")
     terraform_dest.mkdir(parents=True, exist_ok=True)
 
-    for tfvars_file in tfvars_files:
+    for tfvars_file in untracked:
         dest = terraform_dest / tfvars_file.name
         if copy:
             shutil.copy2(tfvars_file, dest)
