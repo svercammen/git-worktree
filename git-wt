@@ -852,12 +852,18 @@ def cmd_create(args, config: Config):
             existence = branch_exists_where(branch)
 
     if existence is None:
-        print(f"Creating new branch '{branch}' from 'main'...")
+        base = args.base or "main"
+        print(f"Creating new branch '{branch}' from '{base}'...")
         try:
-            run_cmd(["git", "branch", branch, "main"])
+            run_cmd(["git", "branch", branch, base])
         except subprocess.CalledProcessError:
             sys.exit(1)
     else:
+        if args.base:
+            print(
+                f"Warning: --base ignored: branch '{branch}' already exists",
+                file=sys.stderr,
+            )
         occupying = find_worktree_for_branch(branch)
         if occupying is not None:
             print(
@@ -1239,6 +1245,7 @@ def run_tui() -> Optional[List[str]]:
             # create
             self.name = "";       self.name_cur = 0
             self.branch = "";     self.branch_cur = 0
+            self.base = "";       self.base_cur = 0
             self.no_install = False
             self.no_open  = False
             self.no_cd      = False
@@ -1260,13 +1267,14 @@ def run_tui() -> Optional[List[str]]:
     # is_cb: False = text input, True = checkbox,
     #        "select" = ←/→ option picker, "multi" = ↑/↓ list with Space to toggle
     CREATE_FIELDS = [
-        ("name",         "Name:         ", False,    "worktree directory name",                    "",                     True),
-        ("branch",       "Branch:       ", False,    "branch to check out",                        "<name> (if omitted)",  False),
-        ("no_install",   "--no-install  ", True,     "skip dependency installation",               "",                     False),
-        ("no_open",      "--no-open     ", True,     "don't launch the editor after create",       "",                     False),
-        ("no_cd",        "--no-cd       ", True,     "don't cd into the worktree after creation",  "",                     False),
-        ("no_ide",       "--no-ide      ", True,     "skip IDE configuration",                     "",                     False),
-        ("copy_env",     "--copy-env    ", True,     "copy .env files instead of symlinking",      "",                     False),
+        ("name",         "Name:         ", False,    "worktree directory name",                        "",                     True),
+        ("branch",       "Branch:       ", False,    "branch to check out",                            "<name> (if omitted)",  False),
+        ("base",         "Base:         ", False,    "start-point for a new branch (only used when branch doesn't exist)", "main (if omitted)",    False),
+        ("no_install",   "--no-install  ", True,     "skip dependency installation",                   "",                     False),
+        ("no_open",      "--no-open     ", True,     "don't launch the editor after create",           "",                     False),
+        ("no_cd",        "--no-cd       ", True,     "don't cd into the worktree after creation",      "",                     False),
+        ("no_ide",       "--no-ide      ", True,     "skip IDE configuration",                         "",                     False),
+        ("copy_env",     "--copy-env    ", True,     "copy .env files instead of symlinking",          "",                     False),
     ]
     REMOVE_FIELDS = [
         ("remove_selected", "Worktrees:    ", "multi",  "Space: toggle, ↑↓: move",   "", True),
@@ -1286,6 +1294,7 @@ def run_tui() -> Optional[List[str]]:
             parts: List[str] = ["create"]
             if s.name:        parts.append(s.name)
             if s.branch:      parts += ["--branch", s.branch]
+            if s.base:        parts += ["--base", s.base]
             if s.no_install:  parts.append("--no-install")
             if s.no_open:     parts.append("--no-open")
             if s.no_cd:       parts.append("--no-cd")
@@ -1663,6 +1672,7 @@ def main():
     create_parser = subparsers.add_parser("create", help="Create a new worktree")
     create_parser.add_argument("name", help="Worktree directory name (slashes are replaced with dashes)")
     create_parser.add_argument("--branch", help="Branch to check out (defaults to the worktree name)")
+    create_parser.add_argument("--base", help="Start-point for a new branch (only used when branch doesn't exist; defaults to main)")
     create_parser.add_argument("--path", help="Custom worktree path")
     create_parser.add_argument("--no-install", action="store_true", help="Skip dependency installation")
     create_parser.add_argument("--no-open", action="store_true", help="Don't open editor")
