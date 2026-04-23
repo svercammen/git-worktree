@@ -252,6 +252,100 @@ def topological_sort(projects: List[Project]) -> List[Project]:
 
 # --- Dependency Installation ---
 
+def get_python_constraint(project_path: Path) -> Optional[str]:
+    """Read the Python version constraint from a project's pyproject.toml."""
+    pyproject = project_path / "pyproject.toml"
+    if not pyproject.exists():
+        return None
+    try:
+        import tomllib
+    except ImportError:
+        return None
+    try:
+        with open(pyproject, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+    poetry_val = (
+        data.get("tool", {}).get("poetry", {}).get("dependencies", {}).get("python")
+    )
+    if isinstance(poetry_val, dict):
+        poetry_val = poetry_val.get("version")
+    if isinstance(poetry_val, str):
+        return poetry_val
+    pep621 = data.get("project", {}).get("requires-python")
+    return pep621 if isinstance(pep621, str) else None
+
+
+def _cmp_version(a: Tuple[int, ...], b: Tuple[int, ...]) -> int:
+    n = max(len(a), len(b))
+    a = a + (0,) * (n - len(a))
+    b = b + (0,) * (n - len(b))
+    return (a > b) - (a < b)
+
+
+def _match_single_constraint(ver: Tuple[int, ...], spec: str) -> bool:
+    import re as _re
+    m = _re.match(r'^\s*(==|!=|>=|<=|>|<|~=|~|\^|=)?\s*(\d[\d.]*)\s*$', spec)
+    if not m:
+        return True
+    op = m.group(1) or "=="
+    target = tuple(int(p) for p in m.group(2).split("."))
+    if op in ("==", "="):
+        return ver[:len(target)] == target
+    if op == "!=":
+        return ver[:len(target)] != target
+    if op == ">":
+        return _cmp_version(ver, target) > 0
+    if op == ">=":
+        return _cmp_version(ver, target) >= 0
+    if op == "<":
+        return _cmp_version(ver, target) < 0
+    if op == "<=":
+        return _cmp_version(ver, target) <= 0
+    if op in ("~", "~="):
+        if len(target) >= 2:
+            upper = (target[0], target[1] + 1)
+        else:
+            upper = (target[0] + 1,)
+        return _cmp_version(ver, target) >= 0 and _cmp_version(ver, upper) < 0
+    if op == "^":
+        upper_list = list(target)
+        for i, n in enumerate(upper_list):
+            if n > 0:
+                upper_list[i] = n + 1
+                upper_list[i + 1:] = [0] * (len(upper_list) - i - 1)
+                break
+        return _cmp_version(ver, target) >= 0 and _cmp_version(ver, tuple(upper_list)) < 0
+    return True
+
+
+def _match_constraint(ver: Tuple[int, ...], constraint: str) -> bool:
+    specs = [s.strip() for s in constraint.split(",") if s.strip()]
+    if not specs:
+        return True
+    return all(_match_single_constraint(ver, s) for s in specs)
+
+
+def python_cmd_satisfies(python_cmd: str, constraint: str) -> bool:
+    """Check if e.g. 'python3.13' satisfies a version constraint string."""
+    import re as _re
+    m = _re.match(r'python(\d+)\.(\d+)', python_cmd)
+    if not m:
+        return False
+    ver = (int(m.group(1)), int(m.group(2)))
+    return _match_constraint(ver, constraint)
+
+
+def pick_compatible_python(constraint: str) -> Optional[str]:
+    """Return the highest installed python3.X command satisfying the constraint."""
+    for minor in range(20, 7, -1):
+        cmd = f"python3.{minor}"
+        if shutil.which(cmd) and python_cmd_satisfies(cmd, constraint):
+            return cmd
+    return None
+
+
 def get_source_python(source_path: Path, project_name: str) -> Optional[str]:
     """Get the Python executable used by a Poetry project in the source worktree."""
     source_project = source_path / project_name
@@ -309,12 +403,36 @@ def install_dependencies(worktree_path: Path, projects: List[Project], source_pa
             # Ensure in-project venvs (creates poetry.toml if not present)
             run_cmd(["poetry", "config", "--local", "virtualenvs.in-project", "true"], cwd=project_dir)
 
-            # Match the source worktree's Python version
-            if source_path:
-                python_cmd = get_source_python(source_path, project.name)
-                if python_cmd:
-                    print(f"  → using {python_cmd} (matching source worktree)")
-                    run_cmd(["poetry", "env", "use", python_cmd], cwd=project_dir)
+            # Pick a Python that satisfies the project's pyproject.toml constraint.
+            # Prefer the source worktree's Python when compatible; otherwise fall
+            # back to the highest installed python3.X that satisfies.
+            source_python = get_source_python(source_path, project.name) if source_path else None
+            constraint = get_python_constraint(project_dir)
+            python_cmd: Optional[str] = None
+            reason = ""
+
+            if source_python and (not constraint or python_cmd_satisfies(source_python, constraint)):
+                python_cmd = source_python
+                reason = "matching source worktree"
+            elif constraint:
+                pick = pick_compatible_python(constraint)
+                if pick:
+                    python_cmd = pick
+                    reason = (
+                        f"source {source_python} incompatible with {constraint}"
+                        if source_python
+                        else f"satisfies {constraint}"
+                    )
+                elif source_python:
+                    print(
+                        f"  → source uses {source_python}, incompatible with {project.name} ({constraint}); "
+                        f"no alternative python3.X found on PATH.",
+                        file=sys.stderr,
+                    )
+
+            if python_cmd:
+                print(f"  → using {python_cmd} ({reason})")
+                run_cmd(["poetry", "env", "use", python_cmd], cwd=project_dir)
 
             run_cmd(["poetry", "install"], cwd=project_dir)
 
