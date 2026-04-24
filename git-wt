@@ -1848,7 +1848,7 @@ def main():
         "targets", nargs="+", metavar="PATH_OR_BRANCH",
         help="One or more worktree paths or branch names",
     )
-    remove_parser.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    remove_parser.add_argument("-y", "--force", action="store_true", help="Skip confirmation prompt")
 
     # Switch command
     switch_parser = subparsers.add_parser("switch", help="Switch to a worktree by partial name ('-' for main)")
