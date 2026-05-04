@@ -970,6 +970,29 @@ def handle_tfvars_files(source_path: Path, worktree_path: Path, copy: bool = Fal
             dest.symlink_to(tfvars_file)
 
 
+# --- Docker ---
+
+def docker_compose_down(worktree_path: Path):
+    """Tear down the worktree's compose project, if any.
+
+    Each `docker compose up` creates a bridge network; without cleanup these
+    accumulate and exhaust Docker's address pool. Best-effort: silent if Docker
+    isn't available or there's no compose file.
+    """
+    if not shutil.which("docker"):
+        return
+    if not any((worktree_path / name).exists()
+               for name in ("docker-compose.yml", "docker-compose.yaml",
+                            "compose.yml", "compose.yaml")):
+        return
+    print("Tearing down docker compose project...")
+    run_cmd(
+        ["docker", "compose", "down", "--remove-orphans"],
+        cwd=worktree_path,
+        check=False,
+    )
+
+
 # --- Editor ---
 
 def open_editor(editor_cmd: str, worktree_path: Path):
@@ -997,6 +1020,20 @@ def cmd_create(args, config: Config):
 
     name = args.name
     branch = args.branch or name
+
+    # Check for running JetBrains IDE up front — IDE setup will fail later
+    # otherwise, leaving a half-built worktree (deps installed, no IDE config).
+    if not args.no_ide:
+        running_ides = get_running_jetbrains_ides()
+        if running_ides:
+            print(
+                f"Error: JetBrains IDE is running ({', '.join(running_ides)}). "
+                "It would overwrite jdk.table.xml edits on shutdown, breaking the "
+                "SDK registration. Close it and re-run `git wt create`, or pass "
+                "--no-ide to skip IDE setup.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Resolve branch: existing → fetch if remote → create from main
     existence = branch_exists_where(branch)
@@ -1074,18 +1111,8 @@ def cmd_create(args, config: Config):
             print(f"Warning: Dependency installation failed: {e}", file=sys.stderr)
             print(f"You can clean up with: git wt remove {worktree_path}", file=sys.stderr)
 
-    # Set up IDE
+    # Set up IDE (running-IDE check happened up front)
     if not args.no_ide:
-        running_ides = get_running_jetbrains_ides()
-        if running_ides:
-            print(
-                f"Error: JetBrains IDE is running ({', '.join(running_ides)}). "
-                "It would overwrite jdk.table.xml edits on shutdown, breaking the "
-                "SDK registration. Close it and re-run `git wt create`, or pass "
-                "--no-ide to skip IDE setup.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
         try:
             setup_jetbrains(source_path, worktree_path, venv_paths)
             setup_vscode(source_path, worktree_path, projects, venv_paths)
@@ -1201,6 +1228,18 @@ def cmd_remove(args, config):
             seen.add(p)
             unique.append(p)
 
+    # Check for running JetBrains IDE before prompting — avoids confirming
+    # only to fail.
+    running_ides = get_running_jetbrains_ides()
+    if running_ides:
+        print(
+            f"Error: JetBrains IDE is running ({', '.join(running_ides)}). "
+            "It would overwrite jdk.table.xml edits on shutdown, leaving stale "
+            "SDK entries behind. Close it and re-run `git wt remove`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Confirm once unless --force
     if not args.force:
         if len(unique) == 1:
@@ -1214,19 +1253,14 @@ def cmd_remove(args, config):
             print("Cancelled")
             return
 
-    running_ides = get_running_jetbrains_ides()
-    if running_ides:
-        print(
-            f"Error: JetBrains IDE is running ({', '.join(running_ides)}). "
-            "It would overwrite jdk.table.xml edits on shutdown, leaving stale "
-            "SDK entries behind. Close it and re-run `git wt remove`.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     failures = 0
     for worktree_path in unique:
         print(f"\nDestroying worktree at {worktree_path}...")
+
+        try:
+            docker_compose_down(worktree_path)
+        except Exception as e:
+            print(f"Warning: docker compose down failed: {e}", file=sys.stderr)
 
         try:
             unregister_jetbrains_sdks(worktree_path)
