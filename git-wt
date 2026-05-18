@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -989,6 +990,7 @@ def docker_compose_down(worktree_path: Path):
     run_cmd(
         ["docker", "compose", "down", "--remove-orphans"],
         cwd=worktree_path,
+        capture=False,
         check=False,
     )
 
@@ -1023,14 +1025,14 @@ def cmd_create(args, config: Config):
 
     # Check for running JetBrains IDE up front — IDE setup will fail later
     # otherwise, leaving a half-built worktree (deps installed, no IDE config).
-    if not args.no_ide:
+    if not args.no_setup_ide:
         running_ides = get_running_jetbrains_ides()
         if running_ides:
             print(
                 f"Error: JetBrains IDE is running ({', '.join(running_ides)}). "
                 "It would overwrite jdk.table.xml edits on shutdown, breaking the "
                 "SDK registration. Close it and re-run `git wt create`, or pass "
-                "--no-ide to skip IDE setup.",
+                "--no-setup-ide to skip IDE setup.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1059,6 +1061,14 @@ def cmd_create(args, config: Config):
         if args.base:
             print(
                 f"Warning: --base ignored: branch '{branch}' already exists",
+                file=sys.stderr,
+            )
+        behind_check = run_cmd(["git", "rev-list", "--count", f"{branch}..main"], check=False)
+        behind = behind_check.stdout.strip() if behind_check.returncode == 0 else ""
+        if behind.isdigit() and int(behind) > 0:
+            print(
+                f"Warning: branch '{branch}' is {behind} commit(s) behind main — "
+                f"run `git rebase main` (or `git merge main`) in the worktree to update.",
                 file=sys.stderr,
             )
         occupying = find_worktree_for_branch(branch)
@@ -1112,7 +1122,7 @@ def cmd_create(args, config: Config):
             print(f"You can clean up with: git wt remove {worktree_path}", file=sys.stderr)
 
     # Set up IDE (running-IDE check happened up front)
-    if not args.no_ide:
+    if not args.no_setup_ide:
         try:
             setup_jetbrains(source_path, worktree_path, venv_paths)
             setup_vscode(source_path, worktree_path, projects, venv_paths)
@@ -1139,7 +1149,7 @@ def cmd_create(args, config: Config):
 
     # Open editor
     editor = args.editor or config.editor
-    if not args.no_open and config.open_editor:
+    if not args.no_open and not args.no_ide and config.open_editor:
         open_editor(editor, worktree_path)
 
     print(f"\n✓ Worktree created at {worktree_path}")
@@ -1149,6 +1159,25 @@ def cmd_create(args, config: Config):
             Path(args.cd_file).write_text(str(worktree_path))
         except Exception:
             pass
+
+    if args.prompt:
+        if args.prompt_file:
+            # Shell wrapper is present — hand prompt off and let it run claude.
+            try:
+                Path(args.prompt_file).write_text(args.prompt)
+            except Exception:
+                pass
+        else:
+            # Direct `git wt` invocation — exec claude ourselves.
+            print(f"Launching claude in {worktree_path}...")
+            try:
+                os.chdir(worktree_path)
+                os.execvp("claude", ["claude", args.prompt])
+            except FileNotFoundError:
+                print(
+                    f"claude not on PATH — re-run with: cd {worktree_path} && claude {shlex.quote(args.prompt)}",
+                    file=sys.stderr,
+                )
 
 
 def cmd_shell_init():
@@ -1162,11 +1191,12 @@ autoload -Uz _wt
     print(r"""
 wt() {
   if [[ $# -eq 0 ]]; then
-    # TUI mode: pass temp files so the script can communicate cd path and expanded command back
-    local _wt_cd _wt_cmd _exit
+    # TUI mode: pass temp files so the script can communicate cd path, expanded command, and prompt back
+    local _wt_cd _wt_cmd _wt_prompt _exit _prompt
     _wt_cd=$(mktemp)
     _wt_cmd=$(mktemp)
-    git wt --cd-file="$_wt_cd" --cmd-file="$_wt_cmd"
+    _wt_prompt=$(mktemp)
+    git wt --cd-file="$_wt_cd" --cmd-file="$_wt_cmd" --prompt-file="$_wt_prompt"
     _exit=$?
     if [[ $_exit -eq 0 && -s "$_wt_cd" ]]; then
       builtin cd "$(cat "$_wt_cd")"
@@ -1181,17 +1211,40 @@ wt() {
         [[ -n "$_atuin_id" ]] && atuin history end --exit $_exit "$_atuin_id" 2>/dev/null
       fi
     fi
-    rm -f "$_wt_cd" "$_wt_cmd"
+    _prompt=""
+    if [[ $_exit -eq 0 && -s "$_wt_prompt" ]]; then
+      _prompt=$(cat "$_wt_prompt")
+    fi
+    rm -f "$_wt_cd" "$_wt_cmd" "$_wt_prompt"
+    if [[ -n "$_prompt" ]]; then
+      if command -v claude &>/dev/null; then
+        claude "$_prompt"
+      else
+        echo "wt: claude not on PATH — skipping prompt" >&2
+      fi
+    fi
     return $_exit
   elif [[ "$1" == "create" ]]; then
-    local _wt_tmp
+    local _wt_tmp _wt_prompt _exit _prompt
     _wt_tmp=$(mktemp)
-    git wt create "${@:2}" --cd-file="$_wt_tmp"
-    local _exit=$?
+    _wt_prompt=$(mktemp)
+    git wt create "${@:2}" --cd-file="$_wt_tmp" --prompt-file="$_wt_prompt"
+    _exit=$?
     if [[ $_exit -eq 0 && -s "$_wt_tmp" ]]; then
       builtin cd "$(cat "$_wt_tmp")"
     fi
-    rm -f "$_wt_tmp"
+    _prompt=""
+    if [[ $_exit -eq 0 && -s "$_wt_prompt" ]]; then
+      _prompt=$(cat "$_wt_prompt")
+    fi
+    rm -f "$_wt_tmp" "$_wt_prompt"
+    if [[ -n "$_prompt" ]]; then
+      if command -v claude &>/dev/null; then
+        claude "$_prompt"
+      else
+        echo "wt: claude not on PATH — skipping prompt" >&2
+      fi
+    fi
     return $_exit
   elif [[ "$1" == "switch" || "$1" == "-" || ( $# -eq 1 && "$1" != "--" && ! "$1" =~ ^- ) ]]; then
     local _wt_tmp
@@ -1211,6 +1264,14 @@ wt() {
 
 def cmd_remove(args, config):
     """Destroy one or more worktrees and clean up their environments."""
+    # Pin CWD to the main worktree so later git calls don't fail when the
+    # user's CWD (a soon-to-be-removed worktree) is deleted out from under us.
+    main_root = get_main_worktree_root()
+    try:
+        os.chdir(main_root)
+    except OSError:
+        pass
+
     # Resolve all targets first; fail fast if any is unknown
     resolved: List[Path] = []
     for target in args.targets:
@@ -1440,11 +1501,13 @@ def run_tui() -> Optional[List[str]]:
             self.name = "";       self.name_cur = 0
             self.branch = "";     self.branch_cur = 0
             self.base = "";       self.base_cur = 0
-            self.no_install = False
-            self.no_open  = False
-            self.no_cd      = False
-            self.no_ide     = False
-            self.copy_env   = False
+            self.prompt = "";     self.prompt_cur = 0
+            self.no_install   = False
+            self.no_open      = False
+            self.no_cd        = False
+            self.no_ide       = False
+            self.no_setup_ide = False
+            self.copy_env     = False
             # remove
             self.remove_pick = 0  # cursor position in _removable
             self.remove_selected: Set[int] = set()  # indices of checked worktrees
@@ -1464,11 +1527,13 @@ def run_tui() -> Optional[List[str]]:
         ("name",         "Name:         ", False,    "worktree directory name",                        "",                     True),
         ("branch",       "Branch:       ", False,    "branch to check out",                            "<name> (if omitted)",  False),
         ("base",         "Base:         ", False,    "start-point for a new branch (only used when branch doesn't exist)", "main (if omitted)",    False),
-        ("no_install",   "--no-install  ", True,     "skip dependency installation",                   "",                     False),
-        ("no_open",      "--no-open     ", True,     "don't launch the editor after create",           "",                     False),
-        ("no_cd",        "--no-cd       ", True,     "don't cd into the worktree after creation",      "",                     False),
-        ("no_ide",       "--no-ide      ", True,     "skip IDE configuration",                         "",                     False),
-        ("copy_env",     "--copy-env    ", True,     "copy .env files instead of symlinking",          "",                     False),
+        ("prompt",       "Prompt:       ", False,    "initial Claude prompt — launches claude in the worktree", "",            False),
+        ("no_install",   "--no-install   ", True,    "skip dependency installation",                   "",                     False),
+        ("no_open",      "--no-open      ", True,    "don't launch the editor after create",           "",                     False),
+        ("no_cd",        "--no-cd        ", True,    "don't cd into the worktree after creation",      "",                     False),
+        ("no_ide",       "--no-ide       ", True,    "don't auto-launch the IDE after creation",       "",                     False),
+        ("no_setup_ide", "--no-setup-ide ", True,    "skip IDE config (.idea/, .vscode/, SDK reg.)",   "",                     False),
+        ("copy_env",     "--copy-env     ", True,    "copy .env files instead of symlinking",          "",                     False),
     ]
     REMOVE_FIELDS = [
         ("remove_selected", "Worktrees:    ", "multi",  "Space: toggle, ↑↓: move",   "", True),
@@ -1489,11 +1554,13 @@ def run_tui() -> Optional[List[str]]:
             if s.name:        parts.append(s.name)
             if s.branch:      parts += ["--branch", s.branch]
             if s.base:        parts += ["--base", s.base]
-            if s.no_install:  parts.append("--no-install")
-            if s.no_open:     parts.append("--no-open")
-            if s.no_cd:       parts.append("--no-cd")
-            if s.no_ide:      parts.append("--no-ide")
-            if s.copy_env:    parts.append("--copy-env")
+            if s.prompt:      parts += ["--prompt", s.prompt]
+            if s.no_install:    parts.append("--no-install")
+            if s.no_open:       parts.append("--no-open")
+            if s.no_cd:         parts.append("--no-cd")
+            if s.no_ide:        parts.append("--no-ide")
+            if s.no_setup_ide:  parts.append("--no-setup-ide")
+            if s.copy_env:      parts.append("--copy-env")
         elif cmd == "remove":
             parts = ["remove"]
             for idx in sorted(s.remove_selected):
@@ -1690,7 +1757,7 @@ def run_tui() -> Optional[List[str]]:
         # Preview
         stdscr.addstr(row, 2, "─" * min(w - 4, 60), curses.A_DIM)
         row += 1
-        preview = "$ git wt " + " ".join(build_argv())
+        preview = "$ git wt " + shlex.join(build_argv())
         stdscr.addstr(row, 2, preview[:w - 4], curses.A_BOLD)
         row += 1
         stdscr.addstr(row, 2, "─" * min(w - 4, 60), curses.A_DIM)
@@ -1816,12 +1883,15 @@ def main():
     # and must survive subcommand dispatch without confusing argparse.
     _cd_file = None
     _cmd_file = None
+    _prompt_file = None
     filtered = []
     for arg in sys.argv[1:]:
         if arg.startswith("--cd-file="):
             _cd_file = arg[len("--cd-file="):]
         elif arg.startswith("--cmd-file="):
             _cmd_file = arg[len("--cmd-file="):]
+        elif arg.startswith("--prompt-file="):
+            _prompt_file = arg[len("--prompt-file="):]
         else:
             filtered.append(arg)
     sys.argv[1:] = filtered
@@ -1833,7 +1903,7 @@ def main():
         if argv is None:
             sys.exit(0)
         sys.argv[1:] = argv
-        expanded = "git wt " + " ".join(argv)
+        expanded = "git wt " + shlex.join(argv)
         print(f"$ {expanded}")
         if _cmd_file:
             # Shell function is present — it will handle history injection
@@ -1855,6 +1925,9 @@ def main():
         # Re-inject --cd-file for commands that support it, produced by TUI
         if _cd_file and sys.argv[1] in ("create", "switch"):
             sys.argv.append(f"--cd-file={_cd_file}")
+        # Re-inject --prompt-file for create (only relevant if TUI emitted --prompt)
+        if _prompt_file and sys.argv[1] == "create":
+            sys.argv.append(f"--prompt-file={_prompt_file}")
 
     parser = argparse.ArgumentParser(
         prog="git-wt",
@@ -1870,11 +1943,14 @@ def main():
     create_parser.add_argument("--path", help="Custom worktree path")
     create_parser.add_argument("--no-install", action="store_true", help="Skip dependency installation")
     create_parser.add_argument("--no-open", action="store_true", help="Don't open editor")
-    create_parser.add_argument("--no-ide", action="store_true", help="Skip IDE configuration")
+    create_parser.add_argument("--no-ide", action="store_true", help="Don't auto-launch the IDE after creation")
+    create_parser.add_argument("--no-setup-ide", action="store_true", help="Skip IDE configuration (.idea/, .vscode/, SDK registration)")
     create_parser.add_argument("--copy-env", action="store_true", help="Copy .env files instead of symlinking")
     create_parser.add_argument("--editor", help="Editor command to use")
     create_parser.add_argument("--no-cd", action="store_true", help="Don't cd into the new worktree after creation")
+    create_parser.add_argument("--prompt", help="Initial Claude prompt — launches `claude` in the new worktree with this prompt after setup")
     create_parser.add_argument("--cd-file", help=argparse.SUPPRESS)  # used by shell integration
+    create_parser.add_argument("--prompt-file", help=argparse.SUPPRESS)  # used by shell integration
 
     # Destroy command
     remove_parser = subparsers.add_parser("remove", help="Remove one or more worktrees")
@@ -1906,6 +1982,10 @@ def main():
             _cd_file = None  # consumed
 
     args = parser.parse_args()
+
+    if args.command == "create" and args.prompt and args.no_cd:
+        create_parser.error("--prompt is incompatible with --no-cd")
+
     config = Config()
 
     _exit_code = 0

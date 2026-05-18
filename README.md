@@ -74,7 +74,8 @@ Creates a new worktree, installs dependencies, sets up IDE config, symlinks `.en
 | `--no-install` | Skip `poetry install` / `npm install` |
 | `--no-open` | Don't launch the editor after creation |
 | `--no-cd` | Don't change directory into the new worktree |
-| `--no-ide` | Skip IDE configuration (`.idea/`, `.vscode/`) |
+| `--no-ide` | Don't auto-launch the IDE after creation |
+| `--no-setup-ide` | Skip IDE configuration (`.idea/`, `.vscode/`, SDK registration) |
 | `--copy-env` | Copy `.env` files instead of symlinking |
 
 ### Remove a worktree
