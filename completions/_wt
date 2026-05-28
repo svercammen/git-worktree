@@ -48,10 +48,37 @@ _wt_remove_targets() {
   compadd -M 'l:|=* r:|=*' -a filtered
 }
 
+_wt_open_prs() {
+  command -v gh >/dev/null 2>&1 || return
+  local -a entries
+  # gh tab-completion: number:title (truncated). Quiet on auth/network failure.
+  entries=("${(@f)$(gh pr list --limit 30 --json number,title \
+    --jq '.[] | "\(.number):\(.title | .[0:60])"' 2>/dev/null)}")
+  (( ${#entries} )) && _describe 'open PRs' entries
+}
+
+_wt_my_open_jira() {
+  [[ -n "$JIRA_BASE_URL" && -n "$JIRA_EMAIL" && -n "$JIRA_API_TOKEN" ]] || return
+  command -v curl >/dev/null 2>&1 || return
+  local -a entries
+  # Narrow: assignee=me, not done, updated within 14d. Short timeout keeps tab snappy.
+  local jql='assignee=currentUser() AND statusCategory!=Done AND updated>=-14d'
+  local raw
+  raw=$(curl -sS --max-time 3 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    --get "${JIRA_BASE_URL%/}/rest/api/3/search/jql" \
+    --data-urlencode "jql=${jql}" \
+    --data-urlencode 'fields=summary' \
+    --data-urlencode 'maxResults=30' 2>/dev/null) || return
+  command -v jq >/dev/null 2>&1 || return
+  entries=("${(@f)$(printf '%s' "$raw" | jq -r '.issues[]? | "\(.key):\(.fields.summary | .[0:60])"' 2>/dev/null)}")
+  (( ${#entries} )) && _describe 'my open Jira' entries
+}
+
 _wt() {
   local -a subcommands
   subcommands=(
     'create:create a new worktree'
+    'from:create a worktree from a Jira ticket or PR'
     'remove:remove one or more worktrees'
     'switch:switch to a worktree by partial name'
     'list:list all worktrees'
@@ -70,6 +97,16 @@ _wt() {
       ;;
     remove)
       _wt_remove_targets
+      ;;
+    from)
+      if (( CURRENT == 3 )); then
+        local -a _wt_from_targets
+        _wt_from_targets=('pr:GitHub PR (followed by number)')
+        _describe 'from target' _wt_from_targets
+        _wt_my_open_jira
+      elif (( CURRENT == 4 )) && [[ "${words[3]}" == "pr" ]]; then
+        _wt_open_prs
+      fi
       ;;
   esac
 }

@@ -988,7 +988,7 @@ def docker_compose_down(worktree_path: Path):
         return
     print("Tearing down docker compose project...")
     run_cmd(
-        ["docker", "compose", "down", "--remove-orphans"],
+        ["docker", "compose", "down", "--remove-orphans", "--volumes"],
         cwd=worktree_path,
         capture=False,
         check=False,
@@ -1154,30 +1154,431 @@ def cmd_create(args, config: Config):
 
     print(f"\n✓ Worktree created at {worktree_path}")
 
-    if getattr(args, "cd_file", None) and not args.no_cd:
+    _emit_cd_and_prompt(
+        worktree_path,
+        prompt=args.prompt,
+        cd_file=getattr(args, "cd_file", None) if not args.no_cd else None,
+        prompt_file=getattr(args, "prompt_file", None),
+    )
+
+
+def _emit_cd_and_prompt(worktree_path: Path, prompt: Optional[str], cd_file: Optional[str], prompt_file: Optional[str]):
+    """Hand cd path + optional Claude prompt back to the shell wrapper.
+
+    When invoked directly (no wrapper, no prompt-file), exec `claude` ourselves
+    after chdir. Used by both `cmd_create` and the `from`-switch path.
+    """
+    if cd_file:
         try:
-            Path(args.cd_file).write_text(str(worktree_path))
+            Path(cd_file).write_text(str(worktree_path))
         except Exception:
             pass
 
-    if args.prompt:
-        if args.prompt_file:
-            # Shell wrapper is present — hand prompt off and let it run claude.
+    if not prompt:
+        return
+
+    if prompt_file:
+        try:
+            Path(prompt_file).write_text(prompt)
+        except Exception:
+            pass
+        return
+
+    print(f"Launching claude in {worktree_path}...")
+    try:
+        os.chdir(worktree_path)
+        os.execvp("claude", ["claude", prompt])
+    except FileNotFoundError:
+        print(
+            f"claude not on PATH — re-run with: cd {worktree_path} && claude {shlex.quote(prompt)}",
+            file=sys.stderr,
+        )
+
+
+# --- `from` subcommand: ticket/PR → worktree ---
+
+JIRA_TICKET_RE = re.compile(r"^[A-Z]+-\d+$")
+
+
+def _jira_setup_help(reason: str = ""):
+    msg = [
+        "Jira lookup needs env vars: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN.",
+        "  - JIRA_BASE_URL: e.g. https://your-org.atlassian.net",
+        "  - JIRA_EMAIL: the email you log into Jira with",
+        "  - JIRA_API_TOKEN: create at https://id.atlassian.com/manage-profile/security/api-tokens",
+        "Add them to ~/.zshrc (or shell rc) and restart your shell.",
+    ]
+    if reason:
+        msg.insert(0, reason)
+    for line in msg:
+        print(line, file=sys.stderr)
+
+
+def _jira_fetch_issue(ticket: str) -> Optional[dict]:
+    """Fetch a Jira issue via REST (curl). Returns parsed dict or None on failure (after printing reason).
+
+    Uses curl rather than urllib so we pick up the macOS system trust store
+    without depending on certifi or Python SSL bundle config.
+    """
+    base_url = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+    email = os.environ.get("JIRA_EMAIL", "")
+    token = os.environ.get("JIRA_API_TOKEN", "")
+    if not (base_url and email and token):
+        _jira_setup_help()
+        return None
+
+    url = f"{base_url}/rest/api/3/issue/{ticket}?fields=summary,issuetype"
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-sS", "--max-time", "10",
+                "-u", f"{email}:{token}",
+                "-H", "Accept: application/json",
+                "-o", "/dev/stdout",
+                "-w", "%{http_code}",
+                url,
+            ],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        print("Error: `curl` not on PATH (needed for Jira REST).", file=sys.stderr)
+        return None
+
+    if result.returncode != 0:
+        err = (result.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+        print(f"Error reaching Jira ({base_url}): {err[0]}", file=sys.stderr)
+        return None
+
+    body = result.stdout[:-3]
+    status = result.stdout[-3:]
+    if status == "401" or status == "403":
+        _jira_setup_help(f"Jira auth failed (HTTP {status}). Check JIRA_EMAIL/JIRA_API_TOKEN.")
+        return None
+    if status == "404":
+        print(f"Error: Jira ticket {ticket} not found.", file=sys.stderr)
+        return None
+    if not status.startswith("2"):
+        print(f"Error fetching {ticket}: HTTP {status}", file=sys.stderr)
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        print(f"Error: unparseable Jira response for {ticket}.", file=sys.stderr)
+        return None
+
+
+def _slug_from_summary(ticket: str, summary: str) -> Optional[str]:
+    """Translate ticket summary → 2-4 word kebab-case English slug via `claude -p --bare`.
+
+    Returns None on any failure; caller is expected to print the reason already
+    surfaced here and prompt for a manual slug.
+    """
+    prompt = (
+        "Translate this Jira issue summary into a short English kebab-case slug "
+        "of 2-4 lowercase words for a git branch. No quotes, no punctuation, no prefix, "
+        "no ticket id, output nothing but the slug itself.\n\n"
+        f"Summary: {summary}"
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", "haiku", prompt],
+            capture_output=True, text=True, timeout=60, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("Slug translation skipped: `claude` not on PATH.", file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("Slug translation skipped: claude -p timed out.", file=sys.stderr)
+        return None
+
+    if result.returncode != 0:
+        # Surface whichever stream has content — claude prints auth errors to stdout.
+        diag = (result.stderr or result.stdout or "").strip().splitlines()[:2]
+        print(f"Slug translation failed (exit {result.returncode}): {' '.join(diag) or '<no output>'}", file=sys.stderr)
+        return None
+
+    raw = (result.stdout or "").strip().splitlines()[0] if result.stdout else ""
+    raw = raw.strip().strip("`'\"").lower()
+    raw = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    if not raw:
+        print("Slug translation returned empty — fill in manually.", file=sys.stderr)
+        return None
+    return raw
+
+
+def _confirm_branch(proposed: str) -> Optional[str]:
+    """Ask user to confirm/edit a proposed branch string. Returns final branch or None to cancel."""
+    while True:
+        resp = input(f"Create '{proposed}'? [Y/n/e(dit)] ").strip().lower()
+        if resp in ("", "y"):
+            if proposed.endswith("/"):
+                print("Branch is missing a slug after the ticket id.", file=sys.stderr)
+                resp = "e"
+            else:
+                return proposed
+        if resp == "n":
+            return None
+        if resp == "e":
+            editor = os.environ.get("EDITOR", "vi")
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".branch", delete=False) as fh:
+                fh.write(proposed + "\n")
+                tmppath = fh.name
+            edited = ""
             try:
-                Path(args.prompt_file).write_text(args.prompt)
-            except Exception:
-                pass
-        else:
-            # Direct `git wt` invocation — exec claude ourselves.
-            print(f"Launching claude in {worktree_path}...")
-            try:
-                os.chdir(worktree_path)
-                os.execvp("claude", ["claude", args.prompt])
-            except FileNotFoundError:
-                print(
-                    f"claude not on PATH — re-run with: cd {worktree_path} && claude {shlex.quote(args.prompt)}",
-                    file=sys.stderr,
-                )
+                subprocess.run([editor, tmppath], check=False)
+                content = Path(tmppath).read_text()
+                lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+                edited = lines[0] if lines else ""
+            finally:
+                try:
+                    os.unlink(tmppath)
+                except Exception:
+                    pass
+            if not edited:
+                print("Empty branch — cancelled.", file=sys.stderr)
+                return None
+            proposed = edited
+            continue
+
+
+def _find_worktree_matches(ticket: Optional[str], branch: str) -> List[dict]:
+    """Find worktrees that match by ticket id segment, or exact branch.
+
+    Worktree directory names have slashes replaced with dashes (e.g.
+    `bug/TES-498/foo` → `bug-TES-498-foo`), so we match on word-boundary
+    occurrences of the ticket id in either the branch name or the path.
+    """
+    wts = get_worktrees()
+    matches: list[dict] = []
+    seen: set[str] = set()
+    ticket_re = re.compile(rf"(?:^|[/_-]){re.escape(ticket)}(?:[/_-]|$)") if ticket else None
+    for wt in wts:
+        if wt.get("is_main"):
+            continue
+        path_str = str(wt["path"])
+        branch_str = wt.get("branch", "")
+        hit = False
+        if ticket_re and (ticket_re.search(branch_str) or ticket_re.search(path_str)):
+            hit = True
+        if branch_str == branch:
+            hit = True
+        if hit and path_str not in seen:
+            seen.add(path_str)
+            matches.append(wt)
+    return matches
+
+
+def _build_create_namespace(name: str, prompt: Optional[str], cd_file: Optional[str], prompt_file: Optional[str]) -> argparse.Namespace:
+    """Synthesize the Namespace cmd_create expects from a `from` invocation."""
+    return argparse.Namespace(
+        name=name,
+        branch=None,
+        base=None,
+        path=None,
+        no_install=False,
+        no_open=False,
+        no_ide=False,
+        no_setup_ide=False,
+        copy_env=False,
+        editor=None,
+        no_cd=False,
+        prompt=prompt,
+        cd_file=cd_file,
+        prompt_file=prompt_file,
+    )
+
+
+def _handle_collision_or_create(
+    ticket: Optional[str],
+    branch: str,
+    canned_prompt: str,
+    args,
+    config: Config,
+):
+    """Either create a fresh worktree, or offer Switch/New/Cancel on collision."""
+    matches = _find_worktree_matches(ticket, branch)
+    if not matches:
+        ns = _build_create_namespace(
+            name=branch,
+            prompt=canned_prompt,
+            cd_file=getattr(args, "cd_file", None),
+            prompt_file=getattr(args, "prompt_file", None),
+        )
+        cmd_create(ns, config)
+        return
+
+    if len(matches) == 1:
+        wt = matches[0]
+        print(f"Worktree exists at {wt['path']}.")
+        choice = input("[S]witch / [N]ew slug / [C]ancel? ").strip().lower() or "s"
+        if choice == "c":
+            return
+        if choice == "n":
+            new_branch = _confirm_branch(branch + "-alt") or ""
+            if not new_branch:
+                return
+            # User explicitly chose "new" — skip re-checking the same ticket
+            # (the new branch will still contain the ticket id and re-collide).
+            ns = _build_create_namespace(
+                name=new_branch,
+                prompt=canned_prompt,
+                cd_file=getattr(args, "cd_file", None),
+                prompt_file=getattr(args, "prompt_file", None),
+            )
+            cmd_create(ns, config)
+            return
+        target = wt["path"]
+    else:
+        print(f"{len(matches)} existing worktrees match:")
+        for i, wt in enumerate(matches, 1):
+            print(f"  [{i}] {wt['path']}  ({wt.get('branch', '?')})")
+        choice = input(f"[1-{len(matches)}] switch / [N]ew / [C]ancel? ").strip().lower()
+        if choice == "c" or choice == "":
+            return
+        if choice == "n":
+            new_branch = _confirm_branch(branch + "-alt") or ""
+            if not new_branch:
+                return
+            # User explicitly chose "new" — skip re-checking the same ticket
+            # (the new branch will still contain the ticket id and re-collide).
+            ns = _build_create_namespace(
+                name=new_branch,
+                prompt=canned_prompt,
+                cd_file=getattr(args, "cd_file", None),
+                prompt_file=getattr(args, "prompt_file", None),
+            )
+            cmd_create(ns, config)
+            return
+        if not (choice.isdigit() and 1 <= int(choice) <= len(matches)):
+            print("Cancelled.", file=sys.stderr)
+            return
+        target = matches[int(choice) - 1]["path"]
+
+    inner = input("[C]ontinue session / [F]resh prompt / [S]hell only? ").strip().lower() or "c"
+    cd_file = getattr(args, "cd_file", None)
+    prompt_file = getattr(args, "prompt_file", None)
+    if inner == "s":
+        _emit_cd_and_prompt(target, prompt=None, cd_file=cd_file, prompt_file=prompt_file)
+        return
+    if inner == "f":
+        _emit_cd_and_prompt(target, prompt=canned_prompt, cd_file=cd_file, prompt_file=prompt_file)
+        return
+    # Continue: cd + tell user to run `claude --continue` themselves.
+    # (Shell wrapper only knows how to run `claude "$_prompt"`, not `claude --continue`.)
+    if cd_file:
+        try:
+            Path(cd_file).write_text(str(target))
+        except Exception:
+            pass
+    print(f"Switched to {target}. Run `claude --continue` to resume the previous session.")
+
+
+def _from_pr(num_str: str, args, config: Config):
+    try:
+        num = int(num_str)
+    except ValueError:
+        print(f"Error: PR number must be an integer, got '{num_str}'.", file=sys.stderr)
+        sys.exit(1)
+
+    auth = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    if auth.returncode != 0:
+        print("Error: gh CLI not authenticated. Run `gh auth login`.", file=sys.stderr)
+        sys.exit(1)
+
+    view = subprocess.run(
+        ["gh", "pr", "view", str(num), "--json", "title,headRefName,isCrossRepository"],
+        capture_output=True, text=True,
+    )
+    if view.returncode != 0:
+        err = (view.stderr or "").strip()
+        print(f"Error fetching PR #{num}: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = json.loads(view.stdout)
+    except json.JSONDecodeError:
+        print(f"Error: could not parse gh response for PR #{num}.", file=sys.stderr)
+        sys.exit(1)
+
+    if data.get("isCrossRepository"):
+        print(f"Error: PR #{num} is from a fork. Cross-repo PRs are not supported in v1.", file=sys.stderr)
+        sys.exit(1)
+
+    branch = data["headRefName"]
+    title = data.get("title", "")
+    canned = args.prompt or f"Help me test PR #{num} ({title}). Walk me through verification."
+
+    resp = input(f"Check out PR #{num} ({title}) into '{branch}'? [Y/n] ").strip().lower()
+    if resp == "n":
+        return
+
+    _handle_collision_or_create(ticket=None, branch=branch, canned_prompt=canned, args=args, config=config)
+
+
+def _from_jira(ticket: str, args, config: Config):
+    issue = _jira_fetch_issue(ticket)
+    if issue is None:
+        sys.exit(1)
+
+    fields = issue.get("fields", {})
+    issuetype = (fields.get("issuetype") or {}).get("name", "")
+    summary = fields.get("summary", "")
+
+    # Issue type → branch prefix + canned-prompt action.
+    # Sub-task / Spike / Story / Epic etc. fall through to "feature".
+    if issuetype == "Bug":
+        prefix, action = "bug", "/diagnose"
+    elif issuetype == "Task":
+        prefix, action = "task", "/grill-me about"
+    else:
+        prefix, action = "feature", "/grill-me about"
+
+    slug = _slug_from_summary(ticket, summary) or ""
+    if slug:
+        proposed = f"{prefix}/{ticket}/{slug}"
+    else:
+        print(f"Summary: {summary}", file=sys.stderr)
+        proposed = f"{prefix}/{ticket}/"
+
+    branch = _confirm_branch(proposed)
+    if not branch:
+        return
+
+    # Recover slug from possibly-edited branch for the canned prompt.
+    final_slug = branch.split("/", 2)[-1] if "/" in branch else slug
+    label = final_slug or summary
+    canned = args.prompt or f"{action} {ticket} ({label})"
+
+    _handle_collision_or_create(ticket=ticket, branch=branch, canned_prompt=canned, args=args, config=config)
+
+
+def cmd_from(args, config: Config):
+    """Resolve a Jira ticket or PR number to a worktree + canned Claude prompt."""
+    target = args.target
+    rest = args.rest or []
+
+    if target == "pr":
+        if not rest:
+            print("Error: `git wt from pr <number>` requires a PR number.", file=sys.stderr)
+            sys.exit(1)
+        _from_pr(rest[0], args, config)
+        return
+
+    if rest:
+        print(f"Error: unexpected extra arguments: {rest}", file=sys.stderr)
+        sys.exit(1)
+
+    if JIRA_TICKET_RE.match(target):
+        _from_jira(target, args, config)
+        return
+
+    print(
+        f"Error: '{target}' is not a Jira ticket (e.g. TES-123) or `pr <number>`.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def cmd_shell_init():
@@ -1224,11 +1625,12 @@ wt() {
       fi
     fi
     return $_exit
-  elif [[ "$1" == "create" ]]; then
-    local _wt_tmp _wt_prompt _exit _prompt
+  elif [[ "$1" == "create" || "$1" == "from" ]]; then
+    local _wt_tmp _wt_prompt _exit _prompt _sub
+    _sub="$1"
     _wt_tmp=$(mktemp)
     _wt_prompt=$(mktemp)
-    git wt create "${@:2}" --cd-file="$_wt_tmp" --prompt-file="$_wt_prompt"
+    git wt "$_sub" "${@:2}" --cd-file="$_wt_tmp" --prompt-file="$_wt_prompt"
     _exit=$?
     if [[ $_exit -eq 0 && -s "$_wt_tmp" ]]; then
       builtin cd "$(cat "$_wt_tmp")"
@@ -1922,11 +2324,14 @@ def main():
                     _atuin_id = result.stdout.strip()
             except FileNotFoundError:
                 pass  # atuin not installed
-        # Re-inject --cd-file for commands that support it, produced by TUI
-        if _cd_file and sys.argv[1] in ("create", "switch"):
+    # Re-inject --cd-file / --prompt-file for the chosen subcommand.
+    # Stripped above so TUI-mode invocation (no subcommand) doesn't choke argparse;
+    # we put them back here for both TUI (after run_tui picks the subcommand) and
+    # direct invocations like `git wt create foo --cd-file=...`.
+    if len(sys.argv) > 1:
+        if _cd_file and sys.argv[1] in ("create", "switch", "from"):
             sys.argv.append(f"--cd-file={_cd_file}")
-        # Re-inject --prompt-file for create (only relevant if TUI emitted --prompt)
-        if _prompt_file and sys.argv[1] == "create":
+        if _prompt_file and sys.argv[1] in ("create", "from"):
             sys.argv.append(f"--prompt-file={_prompt_file}")
 
     parser = argparse.ArgumentParser(
@@ -1971,8 +2376,28 @@ def main():
     # Shell-init command
     subparsers.add_parser("shell-init", help="Print shell integration for eval in .zshrc / .bashrc")
 
+    # From command: ticket/PR → worktree
+    from_parser = subparsers.add_parser(
+        "from",
+        help="Create a worktree from a Jira ticket (TES-123) or PR (`pr 456`)",
+        description=(
+            "Create a worktree with branch name + canned Claude prompt derived from a Jira "
+            "ticket or GitHub PR.\n\n"
+            "  git wt from TES-123        Jira lookup; branch e.g. feature/TES-123/short-slug\n"
+            "  git wt from pr 456         Same-repo PR; branch = headRefName\n\n"
+            "Jira needs env vars JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN.\n"
+            "`--prompt` overrides the canned Claude prompt (e.g. `/refine TES-123`)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    from_parser.add_argument("target", help="Jira ticket (TES-123) or 'pr'")
+    from_parser.add_argument("rest", nargs="*", help="PR number when target is 'pr'")
+    from_parser.add_argument("--prompt", help="Override the canned Claude prompt")
+    from_parser.add_argument("--cd-file", help=argparse.SUPPRESS)
+    from_parser.add_argument("--prompt-file", help=argparse.SUPPRESS)
+
     # Shorthand: bare name/"-" not matching a subcommand → treat as "switch <name>"
-    KNOWN_COMMANDS = {"create", "remove", "list", "switch", "shell-init"}
+    KNOWN_COMMANDS = {"create", "remove", "list", "switch", "shell-init", "from"}
     if (len(sys.argv) > 1
             and sys.argv[1] not in KNOWN_COMMANDS
             and (sys.argv[1] == "-" or not sys.argv[1].startswith("-"))):
@@ -2000,6 +2425,8 @@ def main():
             cmd_list(args)
         elif args.command == "shell-init":
             cmd_shell_init()
+        elif args.command == "from":
+            cmd_from(args, config)
     except SystemExit as e:
         _exit_code = e.code if isinstance(e.code, int) else 1
         raise
