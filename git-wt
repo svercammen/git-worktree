@@ -26,7 +26,9 @@ class Config:
     def __init__(self):
         self.editor = "idea"
         self.base_dir = "../worktrees/{repo}"
-        self.open_editor = True
+        self.open_editor = False
+        self.setup_ide = False
+        self.install_deps = False
         self._load_config_file()
         self._load_env_vars()
 
@@ -52,6 +54,10 @@ class Config:
                             self.base_dir = value
                         elif key == "OPEN_EDITOR":
                             self.open_editor = value.lower() in ("true", "1", "yes")
+                        elif key == "SETUP_IDE":
+                            self.setup_ide = value.lower() in ("true", "1", "yes")
+                        elif key == "INSTALL_DEPS":
+                            self.install_deps = value.lower() in ("true", "1", "yes")
         except Exception as e:
             print(f"Warning: Failed to load config file: {e}", file=sys.stderr)
 
@@ -63,6 +69,10 @@ class Config:
             self.base_dir = os.environ["GIT_WT_BASE_DIR"]
         if "GIT_WT_OPEN_EDITOR" in os.environ:
             self.open_editor = os.environ["GIT_WT_OPEN_EDITOR"].lower() in ("true", "1", "yes")
+        if "GIT_WT_SETUP_IDE" in os.environ:
+            self.setup_ide = os.environ["GIT_WT_SETUP_IDE"].lower() in ("true", "1", "yes")
+        if "GIT_WT_INSTALL_DEPS" in os.environ:
+            self.install_deps = os.environ["GIT_WT_INSTALL_DEPS"].lower() in ("true", "1", "yes")
 
 
 # --- Utility Functions ---
@@ -914,21 +924,28 @@ def handle_env_files(source_path: Path, worktree_path: Path, projects: List[Proj
                 dest.symlink_to(env_file)
 
 
-def handle_claude_config(source_path: Path, worktree_path: Path):
-    """Symlink .claude/ directory so worktrees share Claude Code configuration."""
-    source_claude = source_path / ".claude"
-    dest_claude = worktree_path / ".claude"
+def _replace_with_symlink(source: Path, dest: Path):
+    """Replace a file or directory with an absolute symlink to source."""
+    if dest.is_symlink() or dest.is_file():
+        dest.unlink()
+    elif dest.is_dir():
+        shutil.rmtree(dest)
+    dest.symlink_to(source)
 
-    if not source_claude.is_dir():
-        return
 
-    print("Symlinking .claude/ directory...")
-    if dest_claude.exists() or dest_claude.is_symlink():
-        if dest_claude.is_symlink():
-            dest_claude.unlink()
-        else:
-            shutil.rmtree(dest_claude)
-    dest_claude.symlink_to(source_claude)
+def handle_agent_config(source_path: Path, worktree_path: Path):
+    """Share Claude Code and Codex project configuration with worktrees."""
+    for name in (".claude", ".agents", ".codex"):
+        source = source_path / name
+        if not source.is_dir():
+            continue
+        print(f"Symlinking {name}/ directory...")
+        _replace_with_symlink(source, worktree_path / name)
+
+    source_agents_md = source_path / "AGENTS.md"
+    if source_agents_md.exists() or source_agents_md.is_symlink():
+        print("Symlinking AGENTS.md...")
+        _replace_with_symlink(source_agents_md, worktree_path / "AGENTS.md")
 
 
 def handle_tfvars_files(source_path: Path, worktree_path: Path, copy: bool = False):
@@ -995,6 +1012,21 @@ def docker_compose_down(worktree_path: Path):
     )
 
 
+def run_worktree_hook(source_path: Path, event: str, worktree_path: Path):
+    """Run an optional repository-owned lifecycle hook.
+
+    A repository may provide `.git-wt/hook.py`. It receives an event (`create`,
+    `remove`, or `adopt`) and the absolute linked-worktree path. The hook is
+    deliberately run from the main checkout so it also works before a new
+    worktree contains the hook's tracked commit.
+    """
+    hook = source_path / ".git-wt" / "hook.py"
+    if not hook.is_file():
+        return False
+    run_cmd([sys.executable, str(hook), event, str(worktree_path)], cwd=source_path, capture=False)
+    return True
+
+
 # --- Editor ---
 
 def open_editor(editor_cmd: str, worktree_path: Path):
@@ -1023,9 +1055,15 @@ def cmd_create(args, config: Config):
     name = args.name
     branch = args.branch or name
 
+    # Resolve IDE behavior: CLI flag (--setup-ide/--no-setup-ide, --open/--no-open)
+    # wins when given; otherwise fall back to config (both default off).
+    do_setup_ide = args.setup_ide if args.setup_ide is not None else config.setup_ide
+    do_open = args.open_editor if args.open_editor is not None else config.open_editor
+    do_install = args.install if args.install is not None else config.install_deps
+
     # Check for running JetBrains IDE up front — IDE setup will fail later
     # otherwise, leaving a half-built worktree (deps installed, no IDE config).
-    if not args.no_setup_ide:
+    if do_setup_ide:
         running_ides = get_running_jetbrains_ides()
         if running_ides:
             print(
@@ -1114,15 +1152,17 @@ def cmd_create(args, config: Config):
 
     # Install dependencies
     venv_paths = {}
-    if not args.no_install:
+    if do_install:
         try:
             venv_paths = install_dependencies(worktree_path, projects, source_path=source_path)
         except Exception as e:
             print(f"Warning: Dependency installation failed: {e}", file=sys.stderr)
             print(f"You can clean up with: git wt remove {worktree_path}", file=sys.stderr)
+    else:
+        print("Skipping dependency installation (pass --install, or run `make install` in the worktree later).")
 
     # Set up IDE (running-IDE check happened up front)
-    if not args.no_setup_ide:
+    if do_setup_ide:
         try:
             setup_jetbrains(source_path, worktree_path, venv_paths)
             setup_vscode(source_path, worktree_path, projects, venv_paths)
@@ -1135,21 +1175,28 @@ def cmd_create(args, config: Config):
     except Exception as e:
         print(f"Warning: .env file handling failed: {e}", file=sys.stderr)
 
+    try:
+        run_worktree_hook(source_path, "create", worktree_path)
+    except Exception as e:
+        print(f"Error: worktree lifecycle hook failed: {e}", file=sys.stderr)
+        run_cmd(["git", "worktree", "remove", str(worktree_path), "--force"], check=False)
+        sys.exit(1)
+
     # Handle Terraform .tfvars files
     try:
         handle_tfvars_files(source_path, worktree_path, copy=args.copy_env)
     except Exception as e:
         print(f"Warning: .tfvars file handling failed: {e}", file=sys.stderr)
 
-    # Handle .claude/ directory
+    # Share agent configuration from the main worktree
     try:
-        handle_claude_config(source_path, worktree_path)
+        handle_agent_config(source_path, worktree_path)
     except Exception as e:
-        print(f"Warning: .claude/ symlink failed: {e}", file=sys.stderr)
+        print(f"Warning: agent config symlink failed: {e}", file=sys.stderr)
 
     # Open editor
     editor = args.editor or config.editor
-    if not args.no_open and not args.no_ide and config.open_editor:
+    if do_open:
         open_editor(editor, worktree_path)
 
     print(f"\n✓ Worktree created at {worktree_path}")
@@ -1377,10 +1424,9 @@ def _build_create_namespace(name: str, prompt: Optional[str], cd_file: Optional[
         branch=None,
         base=None,
         path=None,
-        no_install=False,
-        no_open=False,
-        no_ide=False,
-        no_setup_ide=False,
+        install=True,  # `from` (Jira/PR worktrees) always installs deps too
+        open_editor=None,
+        setup_ide=True,  # `from` (Jira/PR worktrees) always sets up the IDE
         copy_env=False,
         editor=None,
         no_cd=False,
@@ -1721,9 +1767,21 @@ def cmd_remove(args, config):
         print(f"\nDestroying worktree at {worktree_path}...")
 
         try:
-            docker_compose_down(worktree_path)
+            ran_hook = run_worktree_hook(main_root, "remove", worktree_path)
         except Exception as e:
-            print(f"Warning: docker compose down failed: {e}", file=sys.stderr)
+            if not args.force:
+                print(f"Error: worktree cleanup failed: {e}", file=sys.stderr)
+                print("Re-run with --force to remove without successful service cleanup.", file=sys.stderr)
+                failures += 1
+                continue
+            print(f"Warning: bypassing failed worktree cleanup: {e}", file=sys.stderr)
+            ran_hook = True
+
+        if not ran_hook:
+            try:
+                docker_compose_down(worktree_path)
+            except Exception as e:
+                print(f"Warning: docker compose down failed: {e}", file=sys.stderr)
 
         try:
             unregister_jetbrains_sdks(worktree_path)
@@ -1753,6 +1811,25 @@ def cmd_remove(args, config):
         pass
 
     if failures:
+        sys.exit(1)
+
+
+def cmd_adopt(args, config):
+    """Run the repository's adopt hook for an existing linked worktree."""
+    main_root = get_main_worktree_root()
+    if args.target:
+        worktree_path = resolve_worktree(args.target, config)
+        if not worktree_path:
+            print(f"Error: Worktree '{args.target}' not found", file=sys.stderr)
+            sys.exit(1)
+    else:
+        worktree_path = get_git_root()
+
+    if worktree_path.resolve() == main_root.resolve():
+        print("Error: the main worktree permanently uses the default dev ports", file=sys.stderr)
+        sys.exit(1)
+    if not run_worktree_hook(main_root, "adopt", worktree_path):
+        print("Error: this repository has no git-wt adopt hook", file=sys.stderr)
         sys.exit(1)
 
 
@@ -1904,11 +1981,10 @@ def run_tui() -> Optional[List[str]]:
             self.branch = "";     self.branch_cur = 0
             self.base = "";       self.base_cur = 0
             self.prompt = "";     self.prompt_cur = 0
-            self.no_install   = False
-            self.no_open      = False
+            self.install      = False
             self.no_cd        = False
-            self.no_ide       = False
-            self.no_setup_ide = False
+            self.open_editor  = False
+            self.setup_ide    = False
             self.copy_env     = False
             # remove
             self.remove_pick = 0  # cursor position in _removable
@@ -1930,11 +2006,10 @@ def run_tui() -> Optional[List[str]]:
         ("branch",       "Branch:       ", False,    "branch to check out",                            "<name> (if omitted)",  False),
         ("base",         "Base:         ", False,    "start-point for a new branch (only used when branch doesn't exist)", "main (if omitted)",    False),
         ("prompt",       "Prompt:       ", False,    "initial Claude prompt — launches claude in the worktree", "",            False),
-        ("no_install",   "--no-install   ", True,    "skip dependency installation",                   "",                     False),
-        ("no_open",      "--no-open      ", True,    "don't launch the editor after create",           "",                     False),
+        ("install",      "--install      ", True,    "install dependencies, poetry/npm (default: off)", "",                    False),
         ("no_cd",        "--no-cd        ", True,    "don't cd into the worktree after creation",      "",                     False),
-        ("no_ide",       "--no-ide       ", True,    "don't auto-launch the IDE after creation",       "",                     False),
-        ("no_setup_ide", "--no-setup-ide ", True,    "skip IDE config (.idea/, .vscode/, SDK reg.)",   "",                     False),
+        ("open_editor",  "--open         ", True,    "launch the editor after create (default: off)",  "",                     False),
+        ("setup_ide",    "--setup-ide    ", True,    "set up IDE config .idea/, .vscode/, SDK (def: off)", "",                 False),
         ("copy_env",     "--copy-env     ", True,    "copy .env files instead of symlinking",          "",                     False),
     ]
     REMOVE_FIELDS = [
@@ -1957,11 +2032,10 @@ def run_tui() -> Optional[List[str]]:
             if s.branch:      parts += ["--branch", s.branch]
             if s.base:        parts += ["--base", s.base]
             if s.prompt:      parts += ["--prompt", s.prompt]
-            if s.no_install:    parts.append("--no-install")
-            if s.no_open:       parts.append("--no-open")
+            if s.install:       parts.append("--install")
             if s.no_cd:         parts.append("--no-cd")
-            if s.no_ide:        parts.append("--no-ide")
-            if s.no_setup_ide:  parts.append("--no-setup-ide")
+            if s.open_editor:   parts.append("--open")
+            if s.setup_ide:     parts.append("--setup-ide")
             if s.copy_env:      parts.append("--copy-env")
         elif cmd == "remove":
             parts = ["remove"]
@@ -2346,10 +2420,9 @@ def main():
     create_parser.add_argument("--branch", help="Branch to check out (defaults to the worktree name)")
     create_parser.add_argument("--base", help="Start-point for a new branch (only used when branch doesn't exist; defaults to main)")
     create_parser.add_argument("--path", help="Custom worktree path")
-    create_parser.add_argument("--no-install", action="store_true", help="Skip dependency installation")
-    create_parser.add_argument("--no-open", action="store_true", help="Don't open editor")
-    create_parser.add_argument("--no-ide", action="store_true", help="Don't auto-launch the IDE after creation")
-    create_parser.add_argument("--no-setup-ide", action="store_true", help="Skip IDE configuration (.idea/, .vscode/, SDK registration)")
+    create_parser.add_argument("--install", dest="install", action=argparse.BooleanOptionalAction, default=None, help="Install dependencies (poetry/npm) after creation (default: off; set INSTALL_DEPS=true to flip; `make install` runs it later)")
+    create_parser.add_argument("--open", dest="open_editor", action=argparse.BooleanOptionalAction, default=None, help="Launch the editor after creation (default: off; set OPEN_EDITOR=true to flip)")
+    create_parser.add_argument("--setup-ide", dest="setup_ide", action=argparse.BooleanOptionalAction, default=None, help="Set up IDE configuration .idea/, .vscode/, SDK registration (default: off; set SETUP_IDE=true to flip)")
     create_parser.add_argument("--copy-env", action="store_true", help="Copy .env files instead of symlinking")
     create_parser.add_argument("--editor", help="Editor command to use")
     create_parser.add_argument("--no-cd", action="store_true", help="Don't cd into the new worktree after creation")
@@ -2363,7 +2436,13 @@ def main():
         "targets", nargs="+", metavar="PATH_OR_BRANCH",
         help="One or more worktree paths or branch names",
     )
-    remove_parser.add_argument("-y", "--force", action="store_true", help="Skip confirmation prompt")
+    remove_parser.add_argument(
+        "-y", "--force", action="store_true",
+        help="Skip confirmation; also bypass a failed repository cleanup hook",
+    )
+
+    adopt_parser = subparsers.add_parser("adopt", help="Configure an existing linked worktree with this repository's hook")
+    adopt_parser.add_argument("target", nargs="?", help="Worktree path or branch (defaults to the current worktree)")
 
     # Switch command
     switch_parser = subparsers.add_parser("switch", help="Switch to a worktree by partial name ('-' for main)")
@@ -2397,7 +2476,7 @@ def main():
     from_parser.add_argument("--prompt-file", help=argparse.SUPPRESS)
 
     # Shorthand: bare name/"-" not matching a subcommand → treat as "switch <name>"
-    KNOWN_COMMANDS = {"create", "remove", "list", "switch", "shell-init", "from"}
+    KNOWN_COMMANDS = {"create", "remove", "adopt", "list", "switch", "shell-init", "from"}
     if (len(sys.argv) > 1
             and sys.argv[1] not in KNOWN_COMMANDS
             and (sys.argv[1] == "-" or not sys.argv[1].startswith("-"))):
@@ -2419,6 +2498,8 @@ def main():
             cmd_create(args, config)
         elif args.command == "remove":
             cmd_remove(args, config)
+        elif args.command == "adopt":
+            cmd_adopt(args, config)
         elif args.command == "switch":
             cmd_switch(args)
         elif args.command == "list":
