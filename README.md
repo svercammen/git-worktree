@@ -66,29 +66,43 @@ wt create <branch>
 wt create <branch> --base <ref>
 ```
 
-Creates a new worktree, installs dependencies, sets up IDE config, symlinks `.env` files, and changes directory into the new worktree.
+Creates a new worktree, sets up IDE config, symlinks `.env` files and shared agent configuration (`.claude/`, `.agents/`, optional `.codex/`, and `AGENTS.md`), and changes directory into the new worktree. Dependencies (poetry/npm) are *not* installed by default — run `make install` in the worktree when you need them (see the monorepo's `Makefile` for per-service targets).
 
 | Option | Description |
 |--------|-------------|
 | `--base <ref>` | Branch, commit SHA, or HEAD to base the new branch on (defaults to `main`) |
-| `--no-install` | Skip `poetry install` / `npm install` |
-| `--no-open` | Don't launch the editor after creation |
+| `--install` / `--no-install` | Install dependencies (`poetry install` / `npm install`) after creation. Default: off (set `INSTALL_DEPS=true` to flip) |
+| `--open` / `--no-open` | Launch the editor after creation. Default: off (set `OPEN_EDITOR=true` to flip) |
 | `--no-cd` | Don't change directory into the new worktree |
-| `--no-ide` | Don't auto-launch the IDE after creation |
-| `--no-setup-ide` | Skip IDE configuration (`.idea/`, `.vscode/`, SDK registration) |
+| `--setup-ide` / `--no-setup-ide` | Set up IDE configuration (`.idea/`, `.vscode/`, SDK registration). Default: off (set `SETUP_IDE=true` to flip) |
 | `--copy-env` | Copy `.env` files instead of symlinking |
+
+Repositories may provide an optional `.git-wt/hook.py`. `git wt` calls it after
+creation, before removal, and through `wt adopt [branch-or-path]`. This lets a
+repository configure worktree-local resources without baking project policy into
+the generic tool.
 
 ### Remove a worktree
 
 ```zsh
 wt remove <branch>
 wt remove <branch1> <branch2> <path/to/wt3>   # remove multiple at once
-wt remove <branch> --force                    # skip confirmation prompt
+wt remove <branch> --force                    # skip confirmation; bypass failed repo cleanup
 ```
 
 Cleans up virtual environments and `node_modules` before removing. Handles orphaned directories (path exists on disk but not registered with git). With multiple targets, a single confirmation prompt lists them all; each is removed independently and failures on one don't abort the rest.
 
 In the TUI's `remove` tab, use `↑`/`↓` to move the cursor through the worktree list and `Space` to toggle selection. Tab completion also supports multiple arguments and filters out worktrees already typed on the command line.
+
+### Adopt an existing worktree
+
+```zsh
+wt adopt
+wt adopt <branch-or-path>
+```
+
+Runs the repository lifecycle hook for an existing linked worktree. It is a
+no-op only when the repository has no hook; the main worktree cannot be adopted.
 
 ### List worktrees
 
@@ -112,9 +126,33 @@ EDITOR=idea
 # {repo} is replaced with the repository name
 BASE_DIR=../worktrees/{repo}
 
-# Whether to open editor after create (overridden by --no-open)
-OPEN_EDITOR=true
+# Whether to launch the editor after create (default: false; --open / --no-open override)
+OPEN_EDITOR=false
+
+# Whether to set up IDE config after create (default: false; --setup-ide / --no-setup-ide override)
+SETUP_IDE=false
+
+# Whether to install dependencies (poetry/npm) after create (default: false; --install / --no-install override)
+INSTALL_DEPS=false
+
+# Agent started by `wt from`; the generated task prompt is appended as its final argument.
+AGENT_COMMAND=codex
+
+# Non-interactive command used to translate Jira titles to English branch slugs.
+SLUG_COMMAND=codex exec --sandbox read-only -m gpt-5.6-luna -c model_reasoning_effort="low"
 ```
+
+### Start an agent from a Jira ticket or PR
+
+```zsh
+wt from TES-605
+wt from 605
+wt from pr 456
+```
+
+`from` accepts either `TES-605` or the bare ticket number `605`, fetches ticket metadata, suggests a slug for you to edit, creates or reuses the worktree, and opens it in a Herdr workspace. Its pane starts `make dev-up` and then the configured agent. The calling shell remains where it was.
+
+Set `AGENT_COMMAND=claude`, `AGENT_COMMAND=pi`, or another command in the configuration file. The generated prompt is appended as the final argument; use `{prompt}` inside the command when it must appear in a specific argument position. `SLUG_COMMAND` is deliberately separate: it must be a non-interactive command that returns only the English slug.
 
 ---
 

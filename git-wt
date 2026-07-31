@@ -6,6 +6,7 @@ IDE configuration, and environment setup for monorepo development.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -13,6 +14,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -29,6 +33,8 @@ class Config:
         self.open_editor = False
         self.setup_ide = False
         self.install_deps = False
+        self.agent_command = "codex"
+        self.slug_command = "codex exec --sandbox read-only"
         self._load_config_file()
         self._load_env_vars()
 
@@ -58,6 +64,10 @@ class Config:
                             self.setup_ide = value.lower() in ("true", "1", "yes")
                         elif key == "INSTALL_DEPS":
                             self.install_deps = value.lower() in ("true", "1", "yes")
+                        elif key == "AGENT_COMMAND":
+                            self.agent_command = value
+                        elif key == "SLUG_COMMAND":
+                            self.slug_command = value
         except Exception as e:
             print(f"Warning: Failed to load config file: {e}", file=sys.stderr)
 
@@ -73,6 +83,10 @@ class Config:
             self.setup_ide = os.environ["GIT_WT_SETUP_IDE"].lower() in ("true", "1", "yes")
         if "GIT_WT_INSTALL_DEPS" in os.environ:
             self.install_deps = os.environ["GIT_WT_INSTALL_DEPS"].lower() in ("true", "1", "yes")
+        if "GIT_WT_AGENT_COMMAND" in os.environ:
+            self.agent_command = os.environ["GIT_WT_AGENT_COMMAND"]
+        if "GIT_WT_SLUG_COMMAND" in os.environ:
+            self.slug_command = os.environ["GIT_WT_SLUG_COMMAND"]
 
 
 # --- Utility Functions ---
@@ -1207,6 +1221,7 @@ def cmd_create(args, config: Config):
         cd_file=getattr(args, "cd_file", None) if not args.no_cd else None,
         prompt_file=getattr(args, "prompt_file", None),
     )
+    return worktree_path
 
 
 def _emit_cd_and_prompt(worktree_path: Path, prompt: Optional[str], cd_file: Optional[str], prompt_file: Optional[str]):
@@ -1245,6 +1260,14 @@ def _emit_cd_and_prompt(worktree_path: Path, prompt: Optional[str], cd_file: Opt
 # --- `from` subcommand: ticket/PR → worktree ---
 
 JIRA_TICKET_RE = re.compile(r"^[A-Z]+-\d+$")
+
+
+def _normalize_from_target(target: str) -> str:
+    """Normalize a Jira ticket shorthand while leaving explicit targets intact."""
+    normalized = target.upper()
+    if normalized.isdigit():
+        return f"TES-{normalized}"
+    return normalized
 
 
 def _jira_setup_help(reason: str = ""):
@@ -1314,44 +1337,33 @@ def _jira_fetch_issue(ticket: str) -> Optional[dict]:
         return None
 
 
-def _slug_from_summary(ticket: str, summary: str) -> Optional[str]:
-    """Translate ticket summary → 2-4 word kebab-case English slug via `claude -p --bare`.
-
-    Returns None on any failure; caller is expected to print the reason already
-    surfaced here and prompt for a manual slug.
-    """
+def _suggest_slug(summary: str, config: Config) -> str:
+    """Translate a ticket summary to a concise English branch-slug suggestion."""
     prompt = (
-        "Translate this Jira issue summary into a short English kebab-case slug "
-        "of 2-4 lowercase words for a git branch. No quotes, no punctuation, no prefix, "
-        "no ticket id, output nothing but the slug itself.\n\n"
-        f"Summary: {summary}"
+        "Translate this Jira title into an English git branch slug of at most six lowercase words. "
+        "Use kebab-case. Output only the slug, without a ticket id or punctuation.\n\n"
+        f"Title: {summary}"
     )
-    try:
-        result = subprocess.run(
-            ["claude", "-p", "--model", "haiku", prompt],
-            capture_output=True, text=True, timeout=60, check=False,
-            stdin=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        print("Slug translation skipped: `claude` not on PATH.", file=sys.stderr)
-        return None
-    except subprocess.TimeoutExpired:
-        print("Slug translation skipped: claude -p timed out.", file=sys.stderr)
-        return None
+    command = shlex.split(config.slug_command)
+    if not command:
+        return "work-item"
+    result = subprocess.run(command + [prompt], capture_output=True, text=True, check=False)
+    raw = result.stdout.strip().splitlines()[0] if result.returncode == 0 and result.stdout.strip() else ""
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    return "-".join(slug.split("-")[:6]) or "work-item"
 
-    if result.returncode != 0:
-        # Surface whichever stream has content — claude prints auth errors to stdout.
-        diag = (result.stderr or result.stdout or "").strip().splitlines()[:2]
-        print(f"Slug translation failed (exit {result.returncode}): {' '.join(diag) or '<no output>'}", file=sys.stderr)
-        return None
 
-    raw = (result.stdout or "").strip().splitlines()[0] if result.stdout else ""
-    raw = raw.strip().strip("`'\"").lower()
-    raw = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
-    if not raw:
-        print("Slug translation returned empty — fill in manually.", file=sys.stderr)
+def _confirm_slug(suggested: str) -> Optional[str]:
+    """Let the user accept or replace the generated slug."""
+    raw = input(f"Slug [{suggested}]: ").strip()
+    if raw == "-":
         return None
-    return raw
+    slug = raw or suggested
+    slug = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-")
+    if not slug:
+        print("Slug cannot be empty.", file=sys.stderr)
+        return None
+    return slug
 
 
 def _confirm_branch(proposed: str) -> Optional[str]:
@@ -1368,7 +1380,6 @@ def _confirm_branch(proposed: str) -> Optional[str]:
             return None
         if resp == "e":
             editor = os.environ.get("EDITOR", "vi")
-            import tempfile
             with tempfile.NamedTemporaryFile("w", suffix=".branch", delete=False) as fh:
                 fh.write(proposed + "\n")
                 tmppath = fh.name
@@ -1521,6 +1532,125 @@ def _handle_collision_or_create(
     print(f"Switched to {target}. Run `claude --continue` to resume the previous session.")
 
 
+def _herdr_json(command: list[str]) -> dict:
+    result = run_cmd(command)
+    return json.loads(result.stdout)
+
+
+def _herdr_created_workspace_id(response: dict) -> str:
+    return response["result"]["workspace"]["workspace_id"]
+
+
+def _herdr_started_agent_pane_id(response: dict) -> str:
+    return response["result"]["agent"]["pane_id"]
+
+
+def _bootstrap_launcher_command(bootstrap_command: str) -> str:
+    """Hand the pane to a shell when setup and the agent exit."""
+    return (
+        f"{bootstrap_command}; exit_code=$?; "
+        'if [ "$exit_code" -ne 0 ]; then '
+        "printf '\\nBootstrap failed (exit %s). Press Enter to keep this shell open.\\n' \"$exit_code\"; "
+        'read _; exec "${SHELL:-/bin/sh}"; '
+        'fi; exec "${SHELL:-/bin/sh}"'
+    )
+
+
+def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config, popup: bool) -> None:
+    """Create/reuse the worktree, then start its agent in a Herdr workspace."""
+    matches = _find_worktree_matches(ticket, branch)
+    if matches:
+        print(f"Existing worktree: {matches[0]['path']}")
+        choice = input("[R]euse / [N]ew branch / [C]ancel? ").strip().lower() or "r"
+        if choice == "c":
+            return
+        if choice == "n":
+            branch = _confirm_branch(branch + "-alt") or ""
+            if not branch:
+                return
+            matches = []
+
+    if matches:
+        worktree_path = Path(matches[0]["path"])
+    else:
+        create_args = argparse.Namespace(
+            name=branch, branch=None, base=None, path=None, install=not popup,
+            open_editor=False, setup_ide=False, copy_env=False, editor=None,
+            no_cd=True, prompt=None, cd_file=None, prompt_file=None,
+        )
+        worktree_path = cmd_create(create_args, config)
+
+    listing = _herdr_json(["herdr", "workspace", "list"])
+    workspace_id = next(
+        (item["workspace_id"] for item in listing["result"]["workspaces"]
+         if item.get("worktree", {}).get("checkout_path") == str(worktree_path)),
+        None,
+    )
+    if workspace_id is None:
+        created = _herdr_json([
+            "herdr", "workspace", "create", "--cwd", str(worktree_path),
+            "--label", f"{ticket or branch}", "--no-focus",
+        ])
+        workspace_id = _herdr_created_workspace_id(created)
+
+    prompt_dir = Path("/private/tmp/git-wt-from")
+    prompt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    prompt_file = prompt_dir / f"{hashlib.sha256(str(worktree_path).encode()).hexdigest()[:16]}.prompt"
+    prompt_file.write_text(prompt)
+    prompt_file.chmod(0o600)
+    bootstrap_args = [
+        str(Path(__file__).resolve()), "launch-agent", "--worktree", str(worktree_path), "--prompt-file", str(prompt_file),
+    ]
+    if popup:
+        bootstrap_args.append("--install")
+    bootstrap_command = shlex.join(bootstrap_args)
+    launcher_argv = [
+        "/bin/sh",
+        "-lc",
+        _bootstrap_launcher_command(bootstrap_command),
+    ]
+    agent_name = re.sub(r"[^a-zA-Z0-9_-]", "-", ticket or branch)
+    started = _herdr_json(
+        ["herdr", "agent", "start", agent_name, "--cwd", str(worktree_path), "--workspace", workspace_id,
+         "--focus", "--", *launcher_argv],
+    )
+    agent_pane_id = _herdr_started_agent_pane_id(started)
+    for _ in range(10):
+        panes = _herdr_json(["herdr", "pane", "list", "--workspace", workspace_id])["result"]["panes"]
+        pane_ids = {pane["pane_id"] for pane in panes}
+        if agent_pane_id in pane_ids:
+            for pane_id in pane_ids - {agent_pane_id}:
+                run_cmd(["herdr", "pane", "close", pane_id], capture=False)
+            break
+        time.sleep(0.1)
+    if popup:
+        run_cmd(["herdr", "workspace", "focus", workspace_id], capture=False)
+    print(f"Started {config.agent_command} in Herdr workspace {workspace_id}: {worktree_path}")
+
+
+def cmd_launch_agent(args, config: Config):
+    worktree_path = Path(args.worktree).resolve()
+    prompt_file = Path(args.prompt_file).resolve()
+    if not worktree_path.is_dir() or not prompt_file.is_file():
+        raise RuntimeError("Agent bootstrap requires an existing worktree and prompt file.")
+    prompt = prompt_file.read_text()
+    if args.install:
+        source_path = get_main_worktree_root()
+        projects = detect_projects(source_path)
+        print(f"Installing dependencies for {len(projects)} project(s)...")
+        install_dependencies(worktree_path, projects, source_path=source_path)
+    print(f"Starting dev environment in {worktree_path}...")
+    run_cmd(["make", "dev-up"], cwd=worktree_path, capture=False)
+    argv = shlex.split(config.agent_command)
+    if not argv:
+        raise RuntimeError("AGENT_COMMAND cannot be empty.")
+    if any("{prompt}" in part for part in argv):
+        argv = [part.replace("{prompt}", prompt) for part in argv]
+    else:
+        argv.append(prompt)
+    os.execvp(argv[0], argv)
+
+
 def _from_pr(num_str: str, args, config: Config):
     try:
         num = int(num_str)
@@ -1560,12 +1690,15 @@ def _from_pr(num_str: str, args, config: Config):
     if resp == "n":
         return
 
-    _handle_collision_or_create(ticket=None, branch=branch, canned_prompt=canned, args=args, config=config)
+    _launch_from(branch=branch, ticket=None, prompt=canned, config=config, popup=args.popup)
 
 
 def _from_jira(ticket: str, args, config: Config):
     issue = _jira_fetch_issue(ticket)
     if issue is None:
+        if args.popup:
+            input("Press Enter to close...")
+            return
         sys.exit(1)
 
     fields = issue.get("fields", {})
@@ -1581,31 +1714,27 @@ def _from_jira(ticket: str, args, config: Config):
     else:
         prefix, action = "feature", "/grill-me about"
 
-    slug = _slug_from_summary(ticket, summary) or ""
-    if slug:
-        proposed = f"{prefix}/{ticket}/{slug}"
-    else:
-        print(f"Summary: {summary}", file=sys.stderr)
-        proposed = f"{prefix}/{ticket}/"
-
-    branch = _confirm_branch(proposed)
-    if not branch:
+    print(f"Summary: {summary}")
+    slug = _confirm_slug(_suggest_slug(summary, config))
+    if not slug:
         return
+    branch = f"{prefix}/{ticket}/{slug}"
+    print(f"Branch: {branch}")
 
     # Recover slug from possibly-edited branch for the canned prompt.
     final_slug = branch.split("/", 2)[-1] if "/" in branch else slug
     label = final_slug or summary
     canned = args.prompt or f"{action} {ticket} ({label})"
 
-    _handle_collision_or_create(ticket=ticket, branch=branch, canned_prompt=canned, args=args, config=config)
+    _launch_from(branch=branch, ticket=ticket, prompt=canned, config=config, popup=args.popup)
 
 
 def cmd_from(args, config: Config):
     """Resolve a Jira ticket or PR number to a worktree + canned Claude prompt."""
-    target = args.target
+    target = _normalize_from_target(args.target)
     rest = args.rest or []
 
-    if target == "pr":
+    if args.target.lower() == "pr":
         if not rest:
             print("Error: `git wt from pr <number>` requires a PR number.", file=sys.stderr)
             sys.exit(1)
@@ -1614,6 +1743,9 @@ def cmd_from(args, config: Config):
 
     if rest:
         print(f"Error: unexpected extra arguments: {rest}", file=sys.stderr)
+        if args.popup:
+            input("Press Enter to close...")
+            return
         sys.exit(1)
 
     if JIRA_TICKET_RE.match(target):
@@ -1624,6 +1756,9 @@ def cmd_from(args, config: Config):
         f"Error: '{target}' is not a Jira ticket (e.g. TES-123) or `pr <number>`.",
         file=sys.stderr,
     )
+    if args.popup:
+        input("Press Enter to close...")
+        return
     sys.exit(1)
 
 
@@ -2458,25 +2593,31 @@ def main():
     # From command: ticket/PR → worktree
     from_parser = subparsers.add_parser(
         "from",
-        help="Create a worktree from a Jira ticket (TES-123) or PR (`pr 456`)",
+        help="Create a worktree from a Jira ticket (TES-123 or 123) or PR (`pr 456`)",
         description=(
-            "Create a worktree with branch name + canned Claude prompt derived from a Jira "
-            "ticket or GitHub PR.\n\n"
+            "Create/reuse a worktree and start the configured coding agent in a Herdr workspace.\n\n"
             "  git wt from TES-123        Jira lookup; branch e.g. feature/TES-123/short-slug\n"
+            "  git wt from 123            Shorthand for TES-123\n"
             "  git wt from pr 456         Same-repo PR; branch = headRefName\n\n"
             "Jira needs env vars JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN.\n"
-            "`--prompt` overrides the canned Claude prompt (e.g. `/refine TES-123`)."
+            "`--prompt` overrides the generated agent prompt. AGENT_COMMAND selects the agent."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    from_parser.add_argument("target", help="Jira ticket (TES-123) or 'pr'")
+    from_parser.add_argument("target", help="Jira ticket (TES-123 or 123) or 'pr'")
     from_parser.add_argument("rest", nargs="*", help="PR number when target is 'pr'")
     from_parser.add_argument("--prompt", help="Override the canned Claude prompt")
+    from_parser.add_argument("--popup", action="store_true", help="Launch through a Herdr popup and defer setup to its workspace")
     from_parser.add_argument("--cd-file", help=argparse.SUPPRESS)
     from_parser.add_argument("--prompt-file", help=argparse.SUPPRESS)
 
+    launch_agent_parser = subparsers.add_parser("launch-agent", help=argparse.SUPPRESS)
+    launch_agent_parser.add_argument("--worktree", required=True)
+    launch_agent_parser.add_argument("--prompt-file", required=True)
+    launch_agent_parser.add_argument("--install", action="store_true")
+
     # Shorthand: bare name/"-" not matching a subcommand → treat as "switch <name>"
-    KNOWN_COMMANDS = {"create", "remove", "adopt", "list", "switch", "shell-init", "from"}
+    KNOWN_COMMANDS = {"create", "remove", "adopt", "list", "switch", "shell-init", "from", "launch-agent"}
     if (len(sys.argv) > 1
             and sys.argv[1] not in KNOWN_COMMANDS
             and (sys.argv[1] == "-" or not sys.argv[1].startswith("-"))):
@@ -2507,7 +2648,21 @@ def main():
         elif args.command == "shell-init":
             cmd_shell_init()
         elif args.command == "from":
-            cmd_from(args, config)
+            try:
+                cmd_from(args, config)
+            except SystemExit:
+                if not args.popup:
+                    raise
+                input("Press Enter to close...")
+                _exit_code = 1
+            except Exception:
+                if not args.popup:
+                    raise
+                traceback.print_exc()
+                input("Press Enter to close...")
+                _exit_code = 1
+        elif args.command == "launch-agent":
+            cmd_launch_agent(args, config)
     except SystemExit as e:
         _exit_code = e.code if isinstance(e.code, int) else 1
         raise

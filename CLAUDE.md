@@ -35,6 +35,10 @@ The `wt()` shell function wraps `git wt` to enable:
 
 ## Key implementation details
 
+### Shared agent configuration
+
+`handle_agent_config` replaces `.claude/`, `.agents/`, and `.codex/` in a new worktree with symlinks to the corresponding directories in the main worktree when they exist. It also symlinks `AGENTS.md` when present, so Claude Code and Codex use the same project configuration in every worktree.
+
 ### Global pre-argparse flags
 `--cd-file=PATH` and `--cmd-file=PATH` are extracted from sys.argv before argparse sees them. They're injected by the `wt()` shell function for TUI mode. After TUI produces argv, `--cd-file` is re-injected for `create` and `switch` subparsers.
 
@@ -60,7 +64,7 @@ The output uses `autoload -Uz _wt` + `compdef _wt wt` to explicitly register the
 - Guarded by `command -v atuin` check (shell) and `FileNotFoundError` catch (Python)
 
 ## Config file
-`~/.config/git-wt/config` — keys: `EDITOR`, `BASE_DIR` (supports `{repo}`), `OPEN_EDITOR`
+`~/.config/git-wt/config` — keys: `EDITOR`, `BASE_DIR` (supports `{repo}`), `OPEN_EDITOR` (default false; launch editor after create), `SETUP_IDE` (default false; set up `.idea`/`.vscode`/SDK), `INSTALL_DEPS` (default false; run `poetry install`/`npm install`). CLI `--open`/`--no-open`, `--setup-ide`/`--no-setup-ide`, and `--install`/`--no-install` (all BooleanOptionalAction) override the respective config default per-invocation. Exception: `wt from` (Jira/PR worktrees) hardcodes `setup_ide=True` and `install=True` in `_build_create_namespace`, so it always sets up the IDE and installs deps regardless of config.
 Default worktree location: `../worktrees/{repo}/<branch>` relative to git root's parent.
 
 ### In-project virtualenvs
