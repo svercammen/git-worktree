@@ -1612,7 +1612,7 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     agent_name = re.sub(r"[^a-zA-Z0-9_-]", "-", ticket or branch)
     started = _herdr_json(
         ["herdr", "agent", "start", agent_name, "--cwd", str(worktree_path), "--workspace", workspace_id,
-         "--focus", "--", *launcher_argv],
+         "--focus", "--env", f"PATH={os.environ.get('PATH', '')}", "--", *launcher_argv],
     )
     agent_pane_id = _herdr_started_agent_pane_id(started)
     for _ in range(10):
