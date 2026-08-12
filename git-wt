@@ -1601,8 +1601,9 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     bootstrap_args = [
         str(Path(__file__).resolve()), "launch-agent", "--worktree", str(worktree_path), "--prompt-file", str(prompt_file),
     ]
-    if popup:
-        bootstrap_args.append("--install")
+    # `make dev-up` starts the Docker development stack and supplies its own
+    # dependencies. Avoid a redundant host-side Poetry/npm install for each
+    # popup-created worktree.
     bootstrap_command = shlex.join(bootstrap_args)
     launcher_argv = [
         "/bin/sh",
