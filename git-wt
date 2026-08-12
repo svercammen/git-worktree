@@ -1593,7 +1593,7 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
         ])
         workspace_id = _herdr_created_workspace_id(created)
 
-    prompt_dir = Path("/private/tmp/git-wt-from")
+    prompt_dir = Path(tempfile.gettempdir()) / "git-wt-from"
     prompt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     prompt_file = prompt_dir / f"{hashlib.sha256(str(worktree_path).encode()).hexdigest()[:16]}.prompt"
     prompt_file.write_text(prompt)
