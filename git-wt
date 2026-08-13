@@ -1592,12 +1592,12 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
             "--label", f"{ticket or branch}", "--no-focus",
         ])
         workspace_id = _herdr_created_workspace_id(created)
-        bootstrap_pane_id = _herdr_workspace_root_pane_id(created)
+        agent_pane_id = _herdr_workspace_root_pane_id(created)
     else:
         panes = _herdr_json(["herdr", "pane", "list", "--workspace", workspace_id])["result"]["panes"]
         if not panes:
             raise RuntimeError(f"Herdr workspace {workspace_id} has no available pane.")
-        bootstrap_pane_id = panes[0]["pane_id"]
+        agent_pane_id = panes[0]["pane_id"]
 
     prompt_dir = Path(tempfile.gettempdir()) / "git-wt-from"
     prompt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1607,12 +1607,12 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     # `make dev-up` starts the Docker development stack and supplies its own
     # dependencies. Avoid a redundant host-side Poetry/npm install for each
     # popup-created worktree.
-    run_cmd(["herdr", "pane", "run", bootstrap_pane_id, "make", "dev-up"], capture=False)
-    agent_pane = _herdr_json([
-        "herdr", "pane", "split", "--pane", bootstrap_pane_id, "--direction", "right",
-        "--cwd", str(worktree_path), "--focus",
+    bootstrap_pane = _herdr_json([
+        "herdr", "pane", "split", "--pane", agent_pane_id, "--direction", "down",
+        "--cwd", str(worktree_path), "--no-focus",
     ])
-    agent_pane_id = agent_pane["result"]["pane"]["pane_id"]
+    bootstrap_pane_id = bootstrap_pane["result"]["pane"]["pane_id"]
+    run_cmd(["herdr", "pane", "run", bootstrap_pane_id, "make", "dev-up"], capture=False)
     agent_name = re.sub(r"[^a-zA-Z0-9_-]", "-", ticket or branch).lower()
     agent_kind, agent_args = _herdr_agent_command(config)
     start_command = [
