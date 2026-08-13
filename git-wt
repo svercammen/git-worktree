@@ -1615,10 +1615,12 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     agent_pane_id = agent_pane["result"]["pane"]["pane_id"]
     agent_name = re.sub(r"[^a-zA-Z0-9_-]", "-", ticket or branch).lower()
     agent_kind, agent_args = _herdr_agent_command(config)
-    _herdr_json([
+    start_command = [
         "herdr", "agent", "start", agent_name, "--kind", agent_kind, "--pane", agent_pane_id,
-        "--", *agent_args,
-    ])
+    ]
+    if agent_args:
+        start_command.extend(["--", *agent_args])
+    _herdr_json(start_command)
     _herdr_json(["herdr", "agent", "prompt", agent_name, prompt])
     if popup:
         run_cmd(["herdr", "workspace", "focus", workspace_id], capture=False)
