@@ -1556,6 +1556,19 @@ def _herdr_agent_command(config: Config) -> tuple[str, list[str]]:
     return kind, argv[1:]
 
 
+def _start_herdr_agent(command: list[str]) -> dict:
+    """Wait briefly for a newly created Herdr pane to reach its shell prompt."""
+    deadline = time.monotonic() + 10
+    while True:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        if time.monotonic() >= deadline:
+            error = result.stderr.strip() or result.stdout.strip() or "unknown Herdr error"
+            raise RuntimeError(f"Could not start Herdr agent after waiting for its pane: {error}")
+        time.sleep(0.25)
+
+
 def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config, popup: bool) -> None:
     """Create/reuse the worktree, then start its agent in a Herdr workspace."""
     matches = _find_worktree_matches(ticket, branch)
@@ -1611,7 +1624,7 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     # popup-created worktree.
     bootstrap_pane = _herdr_json([
         "herdr", "pane", "split", "--pane", agent_pane_id, "--direction", "down",
-        "--ratio", "0.25", "--cwd", str(worktree_path), *workspace_env, "--no-focus",
+        "--ratio", "0.75", "--cwd", str(worktree_path), *workspace_env, "--no-focus",
     ])
     bootstrap_pane_id = bootstrap_pane["result"]["pane"]["pane_id"]
     run_cmd(["herdr", "pane", "run", bootstrap_pane_id, "make", "dev-up"], capture=False)
@@ -1622,7 +1635,7 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     ]
     if agent_args:
         start_command.extend(["--", *agent_args])
-    _herdr_json(start_command)
+    _start_herdr_agent(start_command)
     _herdr_json(["herdr", "agent", "prompt", agent_name, prompt])
     if popup:
         run_cmd(["herdr", "workspace", "focus", workspace_id], capture=False)
