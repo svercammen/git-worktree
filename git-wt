@@ -1592,12 +1592,12 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
             "--label", f"{ticket or branch}", "--no-focus",
         ])
         workspace_id = _herdr_created_workspace_id(created)
-        pane_id = _herdr_workspace_root_pane_id(created)
+        bootstrap_pane_id = _herdr_workspace_root_pane_id(created)
     else:
         panes = _herdr_json(["herdr", "pane", "list", "--workspace", workspace_id])["result"]["panes"]
         if not panes:
             raise RuntimeError(f"Herdr workspace {workspace_id} has no available pane.")
-        pane_id = panes[0]["pane_id"]
+        bootstrap_pane_id = panes[0]["pane_id"]
 
     prompt_dir = Path(tempfile.gettempdir()) / "git-wt-from"
     prompt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1607,22 +1607,16 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     # `make dev-up` starts the Docker development stack and supplies its own
     # dependencies. Avoid a redundant host-side Poetry/npm install for each
     # popup-created worktree.
-    bootstrap_marker = f"__GIT_WT_BOOTSTRAP_{hashlib.sha256(str(prompt_file).encode()).hexdigest()[:12]}__"
-    marker_first, marker_second = bootstrap_marker[:16], bootstrap_marker[16:]
-    bootstrap_command = (
-        f"marker={shlex.quote(marker_first)}{shlex.quote(marker_second)}; "
-        f"make dev-up; exit_code=$?; "
-        "printf '%s:%s\\n' \"$marker\" \"$exit_code\""
-    )
-    run_cmd(["herdr", "pane", "run", pane_id, "/bin/sh", "-lc", bootstrap_command], capture=False)
-    output = _herdr_json(["herdr", "pane", "wait-output", pane_id, "--match", f"{bootstrap_marker}:"])
-    pane_text = output["result"]["read"].get("text", "")
-    if f"{bootstrap_marker}:0" not in pane_text:
-        raise RuntimeError(f"Bootstrap failed in Herdr pane {pane_id}; inspect that pane for details.")
-    agent_name = re.sub(r"[^a-zA-Z0-9_-]", "-", ticket or branch)
+    run_cmd(["herdr", "pane", "run", bootstrap_pane_id, "make", "dev-up"], capture=False)
+    agent_pane = _herdr_json([
+        "herdr", "pane", "split", "--pane", bootstrap_pane_id, "--direction", "right",
+        "--cwd", str(worktree_path), "--focus",
+    ])
+    agent_pane_id = agent_pane["result"]["pane"]["pane_id"]
+    agent_name = re.sub(r"[^a-zA-Z0-9_-]", "-", ticket or branch).lower()
     agent_kind, agent_args = _herdr_agent_command(config)
     _herdr_json([
-        "herdr", "agent", "start", agent_name, "--kind", agent_kind, "--pane", pane_id,
+        "herdr", "agent", "start", agent_name, "--kind", agent_kind, "--pane", agent_pane_id,
         "--", *agent_args,
     ])
     _herdr_json(["herdr", "agent", "prompt", agent_name, prompt])
