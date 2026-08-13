@@ -1586,10 +1586,12 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
          if item.get("worktree", {}).get("checkout_path") == str(worktree_path)),
         None,
     )
+    dev_address_host = os.environ.get("DEV_ADDRESS_HOST")
+    workspace_env = ["--env", f"DEV_ADDRESS_HOST={dev_address_host}"] if dev_address_host else []
     if workspace_id is None:
         created = _herdr_json([
             "herdr", "workspace", "create", "--cwd", str(worktree_path),
-            "--label", f"{ticket or branch}", "--no-focus",
+            "--label", f"{ticket or branch}", *workspace_env, "--no-focus",
         ])
         workspace_id = _herdr_created_workspace_id(created)
         agent_pane_id = _herdr_workspace_root_pane_id(created)
@@ -1609,7 +1611,7 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
     # popup-created worktree.
     bootstrap_pane = _herdr_json([
         "herdr", "pane", "split", "--pane", agent_pane_id, "--direction", "down",
-        "--cwd", str(worktree_path), "--no-focus",
+        "--cwd", str(worktree_path), *workspace_env, "--no-focus",
     ])
     bootstrap_pane_id = bootstrap_pane["result"]["pane"]["pane_id"]
     run_cmd(["herdr", "pane", "run", bootstrap_pane_id, "make", "dev-up"], capture=False)
@@ -1707,11 +1709,11 @@ def _from_jira(ticket: str, args, config: Config):
     # Issue type → branch prefix + canned-prompt action.
     # Sub-task / Spike / Story / Epic etc. fall through to "feature".
     if issuetype == "Bug":
-        prefix, action = "bug", "/diagnose"
+        prefix, action = "bug", "$diagnose"
     elif issuetype == "Task":
-        prefix, action = "task", "/grill-me about"
+        prefix, action = "task", "$grill-me about"
     else:
-        prefix, action = "feature", "/grill-me about"
+        prefix, action = "feature", "$grill-me about"
 
     print(f"Summary: {summary}")
     slug = _confirm_slug(_suggest_slug(summary, config))
