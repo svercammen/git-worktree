@@ -1627,7 +1627,7 @@ def _launch_from(branch: str, ticket: Optional[str], prompt: str, config: Config
         "--ratio", "0.75", "--cwd", str(worktree_path), *workspace_env, "--no-focus",
     ])
     bootstrap_pane_id = bootstrap_pane["result"]["pane"]["pane_id"]
-    run_cmd(["herdr", "pane", "run", bootstrap_pane_id, "make", "dev-up"], capture=False)
+    run_cmd(["herdr", "pane", "run", bootstrap_pane_id, "make", "dev-up", "seed", "dev-addresses"], capture=False)
     agent_name = re.sub(r"[^a-zA-Z0-9_-]", "-", ticket or branch).lower()
     agent_kind, agent_args = _herdr_agent_command(config)
     start_command = [
@@ -1654,7 +1654,7 @@ def cmd_launch_agent(args, config: Config):
         print(f"Installing dependencies for {len(projects)} project(s)...")
         install_dependencies(worktree_path, projects, source_path=source_path)
     print(f"Starting dev environment in {worktree_path}...")
-    run_cmd(["make", "dev-up"], cwd=worktree_path, capture=False)
+    run_cmd(["make", "dev-up", "seed", "dev-addresses"], cwd=worktree_path, capture=False)
     argv = shlex.split(config.agent_command)
     if not argv:
         raise RuntimeError("AGENT_COMMAND cannot be empty.")
