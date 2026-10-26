@@ -221,6 +221,10 @@ def detect_project(path: Path, name: str) -> Optional[Project]:
     if (path / "pnpm-lock.yaml").exists():
         return Project(path, name, "pnpm")
 
+    # Maven project
+    if (path / "pom.xml").exists():
+        return Project(path, name, "maven")
+
     return None
 
 
